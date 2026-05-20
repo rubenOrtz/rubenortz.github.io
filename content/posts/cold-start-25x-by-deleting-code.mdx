@@ -1,129 +1,163 @@
 ---
-title: "We deleted 4,466 lines and our Flutter cold start went 25x faster"
-description: "How we rebuilt a Flutter app's startup from 7.4s to 294ms — by removing dead scaffolding instead of optimizing code."
+title: "Our Flutter app started in 7 seconds. The fix wasn't to make it faster."
+description: "How we went from 7.4s cold start to 294ms — by removing scaffolding instead of optimizing code. A story about the wrong plan, four bumps along the way, and what we learned to look for next time."
 date: 2026-05-20
 ---
 
-A returning user with three years of history on our Flutter app waited 7.4 seconds from icon tap to a usable home screen. After this refactor: **294 milliseconds**. Twenty-five times faster — and the win came from deleting code, not adding it.
+Until recently, opening our Flutter app meant waiting 7.4 seconds before you could see your training screen. That's a long time. Long enough to lose users. Long enough that we knew the problem was bad, long enough that the ticket for it had been bumped to the next sprint enough times that nobody remembered when it first appeared.
 
-The PR was net **+7,569 / −4,466**. The −4,466 is the win.
+We finally fixed it. Cold start is now **294 milliseconds**. Twenty-five times faster.
 
-## What we thought the problem was
+The fix wasn't a performance optimization. It was learning that most of the work the app was doing on startup wasn't startup work — it was scaffolding we had kept building because we'd forgotten we could stop.
 
-Startup was structured as a sequential pipeline of init "steps", wrapped in `FireAndForgetStep` and `ConditionalStep` helpers, returned by an AB-test factory. We knew it was slow on flaky WiFi — every step had its own timeout, and the splash hung when one fired. The plan was *parallelize main init*. The branch name still says it: `perf/parallel-main-init`.
+This post is about the path between those two facts. It's about the wrong plan we started with, the four bumps we hit along the way, and what we ended up doing instead. If you're not an engineer, none of this should feel inaccessible — the technical detail is the texture, not the point.
 
-That plan was wrong. The pipeline wasn't slow because it was sequential. It was slow because most of it was running on a critical path it didn't belong on.
+## What we thought we were going to do
 
-## The reframe
+The branch was called `perf/parallel-main-init`. The plan was in the name: take the long sequential chain of work the app did when it opened — initialize services, hydrate caches, talk to the server, set up payments — and run as much of it as possible in parallel. Modern phones have eight CPU cores. We were using one. Surely we could do more than one thing at a time.
 
-One sentence shifted everything:
+This was a defensible plan. It would have worked, in the sense that the code would have been faster. It also would have been completely wrong.
 
-<Callout title="The unlock">
-The routing decision — "training / auth / onboarding" — is pure data. It doesn't need the network. It only needs cached tokens + cached user state, both already on disk from the last session.
-</Callout>
+I'll come back to why.
 
-That meant the answer to *where does this user go?* could be reached in roughly 50ms from local storage. Everything else — exercise sync, payments, rankings, analytics, Firebase, Rive runtime — was either not needed before first paint, or needed but already cached.
+## The first bump: the tests passed before, and failed after, but nothing the user could see had changed
 
-The goal stopped being "parallelize init". It became: **resolve the destination from cache, then run everything else in the background.**
+The startup pipeline had tests. Hundreds of them. They asserted things like *step 3 is wrapped in this kind of helper*, and *the factory returns the right configuration for guest users*, and *step #7 fires before step #2*.
 
-## The smoking gun
+These tests passed. They had always passed.
 
-Here's what `main.dart` looked like before the refactor:
+When I started moving pieces around to parallelize them, the tests began to fail. None of the failures were about *what the user observed* — they were about how the code was laid out. The user's experience hadn't changed; the structure of the code had.
 
-```dart title="main.dart (before)"
-void main() async {
-  await runZonedGuarded(() async {
-    await _initializeApp();
-    _setupErrorHandling();
-    _runApp();
-  }, (Object error, StackTrace stack) => _handleException(error));
+This is the first thing I had to admit out loud: **the tests we had weren't testing what we thought they were testing.** They were a museum of the architecture, not a safety net for the behavior. Every time we tried to refactor anything, they screamed. So we stopped refactoring. So the architecture ossified. So things kept getting slower.
 
-  Future<void>.delayed(const Duration(milliseconds: 2000), () {  // [!code highlight]
-    FlutterNativeSplash.remove();
-  });
-}
+The fix wasn't to make the tests pass. The fix was to rewrite them to assert what the user sees, not how the code is arranged. *"The user lands on the training screen within 500 milliseconds of opening the app, on a cached state"* is a test that survives any refactor that keeps the contract. *"Step #3 is this specific kind of helper"* is a test that breaks every time you try to improve anything.
+
+I'm still slightly embarrassed I didn't notice this earlier. The pattern is general — it applies to a lot more than code. Process documents, runbooks, even contracts: the more they describe *how* something is done, the more they fight changes to *how* it's done. Tests that police arrangement are exactly the same trap.
+
+## The second bump: Firebase was hiding in three places I didn't know it was
+
+There's a line you write in basically every Flutter app: `await Firebase.initializeApp()`. It takes about 200 milliseconds. It blocks startup. So in my refactored version, I moved it off the critical path — fire it once, don't wait for it, let the app render and let Firebase be ready by the time anything actually needs it. Done. The app should be faster now.
+
+The app was not faster.
+
+I spent a day trying to understand why. The function I'd moved was no longer being awaited. The trace showed it firing. So why was startup still blocking on Firebase?
+
+It turned out Firebase was hiding in three different places I didn't know it was. Three separate services, buried deep in the dependency-injection wiring, were silently asking for Firebase the moment they were constructed. And they were being constructed during startup. So even though I'd "moved" Firebase off the critical path, three of its tendrils were still on it, waiting for it to be ready, blocking everything behind them.
+
+I had moved one Firebase. There were four.
+
+This is the lesson that took me a day to learn and that's been worth a hundred. **Things you think are isolated rarely are.** In any system of meaningful size, the thing you're trying to change has been depended on, accidentally and silently, by other things that have been around so long you'd forgotten about them. This is true of code, but it's also true of decisions, agreements, deprecated features, and people. The fix is almost never to make the moved thing faster. The fix is to find every place that depended on the old behavior, and only ask for the new behavior when something actually needs it.
+
+## The third bump: a method called `init` was secretly calling a server
+
+There's a class called `ExerciseLocalDb`. It has a method called `init()`. The name suggests, very clearly, that the method initializes a local database. Nothing about that name suggests *network*.
+
+It does, however, talk to the server. Or rather — it does both. It opens a local database, *and then* it quietly tries to synchronize with the API.
+
+For a returning user on good WiFi, this was effectively free — a 50-millisecond round-trip, then the cache got refreshed. For a brand-new user, this was an unauthenticated request to a server that returned an error and then retried until it timed out. **Twenty seconds** of retry. The splash screen sat there, looping its animation, while a method called `init` quietly tried to reach a server it didn't have permission to reach.
+
+I won't tell you how long it took us to find this. I'll tell you what we did the moment we did: we changed the contract. `init()` is local-only. `synchronizeAll()` is the explicit network call. The method's name has to match the method's behavior. Always.
+
+**Code that lies about itself costs more than slow code.** Slow code shows up in a profiler — you can see it. Lying code shows up as inexplicable failures in conditions you didn't expect to test. It's not just code, either. Anything in an organization that says it does one thing while quietly doing another — meetings that are really demos, "syncs" that are really decisions, "policies" that are really preferences — has the same shape, and costs in the same ways.
+
+## The fourth bump: the two-second apology
+
+This is the bump I'll remember longest. Buried at the bottom of `main.dart`, after every initialization had completed, there was this:
+
+```dart
+Future<void>.delayed(const Duration(milliseconds: 2000), () {
+  FlutterNativeSplash.remove();
+});
 ```
 
-A hardcoded two-second splash delay. Someone, at some point, didn't trust their own init to finish, so they hardcoded a floor. Every user paid those two seconds — even when init finished in 200ms.
+A hardcoded two-second delay before removing the splash screen.
 
-There were more like it:
+I don't know who wrote it. I know it predated me by a long time. I can guess the story: at some point, startup didn't always finish before the app tried to render its first frame, and the user would briefly see something broken — a flash of white, an unstyled state, a missing image. So someone added two seconds of padding to make the bad case impossible. Forever.
 
-- `ExerciseLocalDb.init()` was secretly calling the API. On unauthenticated users it returned 401 and blocked the splash for the full timeout — 20 seconds.
-- `Firebase.initializeApp()` was nominally fire-and-forget. It was still blocking startup, because three singletons in the DI graph were silently calling `FirebaseMessaging.instance` during `$initGetIt()`.
-- An AB test that had a winner months ago was still hardcoded as `if (true)` at the entry point — with the losing variant maintained as live code, and a full step-factory pipeline preserving the symmetry.
+Every user paid those two seconds, on every cold start, every time, for years.
 
-The code was the problem. Optimizing it would have made a bad architecture marginally faster. Removing it was the real fix.
+This is the bump I think about most. The two-second delay wasn't an act of ignorance. It was an apology for a problem that probably no longer existed — a debt one engineer had taken on to keep a release from going out broken, then forgotten about because the symptom had stopped showing up. Someone, somewhere, had stopped trusting their own code, and that mistrust had been baked into the user's experience for the rest of time.
 
-## What we built
+Every long-lived system has these. Not just codebases. Every team, every product, every company has its `Future.delayed(2000ms)` equivalents — defensive scars from a panic that was justified at the time, kept in place because they hadn't hurt enough to revisit. **They were never decisions to keep. They were decisions nobody made to remove.**
 
-A new package `lib/packages/app_initialization/`, organized by **phase**, not by feature:
+You don't find them by reading the code. You find them by asking *"wait, why is this here?"* of every line, every meeting, every policy that doesn't immediately explain itself.
 
-```
-sl<AppInitService>().initialize()
-  │
-  ├─ Phase 1: destination resolved      (await, ~50ms from cache)
-  ├─ Phase 2: local caches hydrated     (await)
-  ├─ Phase 3: exercise sync, rankings,  (fire & forget)
-  │           historic training data
-  └─ Phase 4: payments init + sync      (await, after first frame)
-```
+## The fifth bump: the experiment that won, and was never cleaned up
 
-The package owns the work. `main.dart` shrank from 264 lines of inlined orchestration to about 100 lines of three named phase calls. The narrative of cold start is now readable in one file.
+Six months before I started this work, we had run an A/B test on the app's guest-mode flow. The test had a winner. The losing variant was supposed to be removed.
 
-The pattern under every cached step is a single template:
+The code didn't know that.
 
-```dart title="cache_first_loader.dart"
-abstract class CacheFirstLoader<T> {
-  String get label;
-  Future<T?> loadFromCache();
-  Future<T> fetchFromApi();
-  bool isSufficient(T? data);
-  Duration get apiTimeout => const Duration(seconds: 10);
+The entry point still ran a feature-flag check that — due to a hardcoded `true` that someone had added when they declared the test over — always returned the winning variant. But the losing variant was still there. Both variants still had their own factory. Both factories still had their own pipeline. The entire scaffolding was being maintained, tested, type-checked, and shipped to production — and exactly half of it was dead code that hadn't been load-bearing in six months.
 
-  Future<T?> preload() async {
-    final T? cached = await loadFromCache();
+This was the moment the refactor changed character. We weren't optimizing startup anymore. We were removing things that had been pretending to matter.
 
-    if (isSufficient(cached)) {
-      // Cache hit: return now, refresh in background.
-      // ignore: unawaited_futures
-      fetchFromApi().then((_) {}).catchError((_) {});
-      return cached;
-    }
+The reviewer's most common feedback on the pull request was a single word: *borrar*. Delete. Five separate times: delete this, delete this, this method isn't used anywhere, delete, this wrapper exists already and does the same thing. The final pull request *deleted 4,466 lines* and *added 7,569*. The lines added were a tight architecture. The lines deleted were the A/B test that nobody had remembered to clean up.
 
-    try {
-      // Cache miss: block, but bounded.
-      return await fetchFromApi().timeout(apiTimeout);
-    } catch (e) {
-      return cached;
-    }
-  }
-}
-```
+I think about this one a lot, too. **Most teams have A/B tests they never finished retiring.** The platform celebrates launching them. Nobody celebrates retiring them. The cost compounds, and the longer the experiment is "officially over but still in the code", the more decisions you make on top of it that you'd have to unravel to remove it.
 
-One abstract class replaced the conditional-step + fire-and-forget-step combinatorial mess. Subclasses only decide *what counts as a hit*. The complexity that used to live in the orchestration layer now lives in the data layer, where it belongs.
+The pattern isn't specific to A/B tests, either. It's any temporary thing — a feature flag, a workaround, a fallback for a vendor you no longer use — that quietly became permanent because removing it never made it to anyone's roadmap. The hardest cleanup work isn't writing the deletion. It's giving yourself permission to do it.
 
-## The numbers
+## The sentence that ended the search
 
-Same device, same user profile (a returning user with three years of history and roughly 400 sessions), Flutter `--profile` build.
+After a week of *"okay but why is this slow too"*, I stopped trying to parallelize anything and asked a different question:
 
-| Metric | Before | After | Δ |
-| --- | --- | --- | --- |
-| Cold start → home (iPhone) | **7,415 ms** | **294 ms** | **25.2× faster** |
-| Cold start → home (Pixel 8) | 7,415 ms | 478 ms | 15.5× faster |
-| Init pipeline alone | ~478 ms | 10–27 ms | 17–47× faster |
-| `main.dart` size | 264 LOC | ~100 LOC | −62% |
-| Net code | — | +7,569 / **−4,466** | scaffolding → architecture |
+> What does the app actually need before it can show the user **anything**?
 
-A fresh install — where there's no cache to hit — still has to wait for the API. That path is now a deliberate ~2.4s with a native splash that visually matches the Flutter splash, so the transition is invisible. We chose where the user pays the cost; we didn't make them pay it on every cold start.
+The answer surprised me. The app needs to know one of three things, all the time: take the user to their training, take them to a login screen, or take them to onboarding. That's it. *Everything* else — exercise data, payment status, leaderboard rankings, analytics, notification setup, animation runtimes — is either not needed for the first frame, or already cached on the device from the last session.
 
-## What I'd actually like you to take from this
+The routing decision is a piece of data, not a process. It doesn't need the network. It only needs information the device already has on disk, from the last time the user opened the app. We could answer *"where does this user go?"* in about 50 milliseconds. Everything else could happen in the background, after the user was already looking at something useful.
 
-Three things, in decreasing order of likelihood I'm right:
+This is the only sentence in this post that I really want you to remember:
 
-1. **The fastest code is the code you don't run on the critical path.** Optimization is usually scope reduction, not speed-up.
-2. **Tests that assert structure are anti-tests.** The old init tests asserted exact step ordering. They passed before the refactor and failed after — but the behavior hadn't changed. Tests should describe what the user observes, not how the code is laid out.
-3. **The work no one will notice is the work worth doing.** Nobody is opening LinkedIn to praise an init pipeline that now finishes in 300ms instead of 7s. The team is faster. The codebase is smaller. No one writes blog posts about that.
+> The goal stopped being "do startup faster". It became "do less startup."
+
+That's the difference between a performance optimization and an architectural realization. The first one makes the wrong thing faster. The second one notices that most of the wrong thing didn't need to be there.
+
+## Why we chose this shape and not parallelization
+
+The final design has four phases. Each one only blocks the user for the work that actually has to finish before the next thing they see.
+
+1. **Resolve the destination.** The only blocking work. Runs on data already on the device. About 50 milliseconds.
+2. **Hydrate the local caches.** Fast, because everything is already on disk.
+3. **Sync exercise data, leaderboards, training history — in the background.** The user is already looking at the screen when these run. If they fail, the app degrades gracefully — the user sees yesterday's data, not a broken screen.
+4. **Set up payments.** Happens after the first frame is on screen. Doesn't block anything the user can see.
+
+We could have parallelized the old pipeline. It would have been faster. But it still would have done the same total amount of work, just in less time. The user would still have had to wait for *everything* before they saw *anything*.
+
+This shape is different. The user sees the screen the moment the cache can resolve a destination. Everything else happens around them, after they're already inside the app. The app stops asking the user to wait for things they don't yet need.
+
+That's the realization underneath the whole refactor: **the work the user has to wait for is a design choice, not a constraint.** Most performance work treats it as a constraint. The bigger leverage is treating it as a choice.
+
+## The numbers (at the end, where they belong)
+
+Same device, same user, same build mode. Real-device benchmarks, not synthetic.
+
+| Metric | Before | After |
+| --- | --- | --- |
+| Cold start to home (iPhone) | 7,415 ms | 294 ms |
+| Cold start to home (Pixel 8) | 7,415 ms | 478 ms |
+| `main.dart` size | 264 lines | ~100 lines |
+| Net code change | — | +7,569 / −4,466 |
+
+The 25× number is real. We measured it on the same physical phone, with the same user, on the same build. It's not a benchmark game — it's what the user sees the moment they tap the icon.
+
+But the 25× isn't the story. The story is everything that happened to get there.
+
+## What I'd want you to take from this, even if you don't write code
+
+Five things, in order of usefulness.
+
+**The plan you start with is sometimes the trap.** *"Parallelize startup"* was a defensible plan. It would have made the wrong thing faster. The bigger move was to ask whether all that work needed to happen at all. This is true of refactors, but it's also true of strategies, products, even careers. The first framing you arrive at is rarely the one that survives contact with what's actually going on.
+
+**Things that have been there forever are not, by default, load-bearing.** They're frequently the opposite — they're there because nobody had a reason to remove them, which is not the same as having a reason to keep them. This is the most under-applied insight in any organization I've worked in. Most cleanups don't require new judgment. They require permission to act on old judgment that was never followed through.
+
+**The thing you're slightly embarrassed about is a clue, not a flaw.** The two-second apology in `main.dart` wasn't a sign of bad engineering. It was a sign of a system that didn't have the cycles to come back and revisit it. Codebases, products, processes, relationships — they all accumulate small acts of self-defense that nobody remembers were temporary. The fastest way to find them is to look for the thing that makes you wince a little when you read it.
+
+**Anything that describes how something is arranged will fight changes to how it's arranged.** Tests that assert layout. Documentation that names specific tools. Org charts that grow into job descriptions. The more they describe the current shape, the more they resist the next shape. Describe behavior and outcomes instead. They survive reorganization.
+
+**The work nobody will notice is the work worth doing.** Nobody opens a fitness app and says *thanks for the 25× startup*. There's no launch announcement for "we removed scaffolding." But the team is faster. The codebase is smaller. The app stops asking the user to wait. That's a worthwhile thing to do quietly. Most worthwhile things are.
 
 ---
 
-*This refactor was AI-assisted — most of the iteration happened with Claude Opus 4.6 and 4.7 in a multi-agent worktree setup. If "AI-assisted refactor of 192 files and 82 commits" sounds like an oxymoron, I'm writing about how that loop works next.*
+*This refactor was AI-assisted. Most of the iteration happened with Claude Opus 4.6 and 4.7 across a multi-agent setup with parallel worktrees. If "AI-assisted refactor of 192 files across 82 commits" sounds like an oxymoron, I'm writing about how that loop actually works next.*
