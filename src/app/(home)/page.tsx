@@ -28,7 +28,7 @@ export default function HomePage(): ReactElement {
         <HomeCard
           description='Working notes and technical references.'
           href='/docs'
-          icon={{ icon: BookIcon, id: 'api-reference' }}
+          icon={{ icon: BookIcon, id: 'docs' }}
           title='Docs'
         />
       </div>
