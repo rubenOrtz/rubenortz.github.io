@@ -1,0 +1,129 @@
+---
+title: "We deleted 4,466 lines and our Flutter cold start went 25x faster"
+description: "How we rebuilt a Flutter app's startup from 7.4s to 294ms — by removing dead scaffolding instead of optimizing code."
+date: 2026-05-20
+---
+
+A returning user with three years of history on our Flutter app waited 7.4 seconds from icon tap to a usable home screen. After this refactor: **294 milliseconds**. Twenty-five times faster — and the win came from deleting code, not adding it.
+
+The PR was net **+7,569 / −4,466**. The −4,466 is the win.
+
+## What we thought the problem was
+
+Startup was structured as a sequential pipeline of init "steps", wrapped in `FireAndForgetStep` and `ConditionalStep` helpers, returned by an AB-test factory. We knew it was slow on flaky WiFi — every step had its own timeout, and the splash hung when one fired. The plan was *parallelize main init*. The branch name still says it: `perf/parallel-main-init`.
+
+That plan was wrong. The pipeline wasn't slow because it was sequential. It was slow because most of it was running on a critical path it didn't belong on.
+
+## The reframe
+
+One sentence shifted everything:
+
+<Callout title="The unlock">
+The routing decision — "training / auth / onboarding" — is pure data. It doesn't need the network. It only needs cached tokens + cached user state, both already on disk from the last session.
+</Callout>
+
+That meant the answer to *where does this user go?* could be reached in roughly 50ms from local storage. Everything else — exercise sync, payments, rankings, analytics, Firebase, Rive runtime — was either not needed before first paint, or needed but already cached.
+
+The goal stopped being "parallelize init". It became: **resolve the destination from cache, then run everything else in the background.**
+
+## The smoking gun
+
+Here's what `main.dart` looked like before the refactor:
+
+```dart title="main.dart (before)"
+void main() async {
+  await runZonedGuarded(() async {
+    await _initializeApp();
+    _setupErrorHandling();
+    _runApp();
+  }, (Object error, StackTrace stack) => _handleException(error));
+
+  Future<void>.delayed(const Duration(milliseconds: 2000), () {  // [!code highlight]
+    FlutterNativeSplash.remove();
+  });
+}
+```
+
+A hardcoded two-second splash delay. Someone, at some point, didn't trust their own init to finish, so they hardcoded a floor. Every user paid those two seconds — even when init finished in 200ms.
+
+There were more like it:
+
+- `ExerciseLocalDb.init()` was secretly calling the API. On unauthenticated users it returned 401 and blocked the splash for the full timeout — 20 seconds.
+- `Firebase.initializeApp()` was nominally fire-and-forget. It was still blocking startup, because three singletons in the DI graph were silently calling `FirebaseMessaging.instance` during `$initGetIt()`.
+- An AB test that had a winner months ago was still hardcoded as `if (true)` at the entry point — with the losing variant maintained as live code, and a full step-factory pipeline preserving the symmetry.
+
+The code was the problem. Optimizing it would have made a bad architecture marginally faster. Removing it was the real fix.
+
+## What we built
+
+A new package `lib/packages/app_initialization/`, organized by **phase**, not by feature:
+
+```
+sl<AppInitService>().initialize()
+  │
+  ├─ Phase 1: destination resolved      (await, ~50ms from cache)
+  ├─ Phase 2: local caches hydrated     (await)
+  ├─ Phase 3: exercise sync, rankings,  (fire & forget)
+  │           historic training data
+  └─ Phase 4: payments init + sync      (await, after first frame)
+```
+
+The package owns the work. `main.dart` shrank from 264 lines of inlined orchestration to about 100 lines of three named phase calls. The narrative of cold start is now readable in one file.
+
+The pattern under every cached step is a single template:
+
+```dart title="cache_first_loader.dart"
+abstract class CacheFirstLoader<T> {
+  String get label;
+  Future<T?> loadFromCache();
+  Future<T> fetchFromApi();
+  bool isSufficient(T? data);
+  Duration get apiTimeout => const Duration(seconds: 10);
+
+  Future<T?> preload() async {
+    final T? cached = await loadFromCache();
+
+    if (isSufficient(cached)) {
+      // Cache hit: return now, refresh in background.
+      // ignore: unawaited_futures
+      fetchFromApi().then((_) {}).catchError((_) {});
+      return cached;
+    }
+
+    try {
+      // Cache miss: block, but bounded.
+      return await fetchFromApi().timeout(apiTimeout);
+    } catch (e) {
+      return cached;
+    }
+  }
+}
+```
+
+One abstract class replaced the conditional-step + fire-and-forget-step combinatorial mess. Subclasses only decide *what counts as a hit*. The complexity that used to live in the orchestration layer now lives in the data layer, where it belongs.
+
+## The numbers
+
+Same device, same user profile (a returning user with three years of history and roughly 400 sessions), Flutter `--profile` build.
+
+| Metric | Before | After | Δ |
+| --- | --- | --- | --- |
+| Cold start → home (iPhone) | **7,415 ms** | **294 ms** | **25.2× faster** |
+| Cold start → home (Pixel 8) | 7,415 ms | 478 ms | 15.5× faster |
+| Init pipeline alone | ~478 ms | 10–27 ms | 17–47× faster |
+| `main.dart` size | 264 LOC | ~100 LOC | −62% |
+| Net code | — | +7,569 / **−4,466** | scaffolding → architecture |
+
+A fresh install — where there's no cache to hit — still has to wait for the API. That path is now a deliberate ~2.4s with a native splash that visually matches the Flutter splash, so the transition is invisible. We chose where the user pays the cost; we didn't make them pay it on every cold start.
+
+## What I'd actually like you to take from this
+
+Three things, in decreasing order of likelihood I'm right:
+
+1. **The fastest code is the code you don't run on the critical path.** Optimization is usually scope reduction, not speed-up.
+2. **Tests that assert structure are anti-tests.** The old init tests asserted exact step ordering. They passed before the refactor and failed after — but the behavior hadn't changed. Tests should describe what the user observes, not how the code is laid out.
+3. **The work no one will notice is the work worth doing.** Nobody is opening LinkedIn to praise an init pipeline that now finishes in 300ms instead of 7s. The team is faster. The codebase is smaller. No one writes blog posts about that.
+
+---
+
+*This refactor was AI-assisted — most of the iteration happened with Claude Opus 4.6 and 4.7 in a multi-agent worktree setup. If "AI-assisted refactor of 192 files and 82 commits" sounds like an oxymoron, I'm writing about how that loop works next.*
