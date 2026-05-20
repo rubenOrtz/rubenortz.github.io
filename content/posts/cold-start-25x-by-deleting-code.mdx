@@ -126,6 +126,30 @@ The goal stopped being *"do startup faster"*. It became *"do less startup."*
 That's the difference between a performance optimization and an architectural realization. The first one makes the wrong thing faster. The second one notices that most of the wrong thing didn't need to be there.
 </Callout>
 
+## The deeper why: offline-first wasn't optional
+
+*"Do less startup"* was the practical reframe. The deeper one was this: the app had no business requiring the network to show the user anything in the first place.
+
+Think about where people actually open a fitness app. The gym basement where the WiFi goes to die. The park at the edge of cell coverage. The hotel room with the captive portal that refuses to authenticate. The flight where someone wanted to log a workout offline. The morning where home WiFi has decided to take a five-minute break and the user is standing in the kitchen holding a phone, wondering why this app of all apps is the one asking them to wait.
+
+Half the time someone opens a fitness app, the network is either bad or absent. **A fitness app that only works on good WiFi is broken half the time.**
+
+This isn't a UX nicety. It's the contract:
+
+<Callout title="The contract" type="info">
+If the user has used the app before, the app should work — fully, immediately — without the network.
+
+Network is for **refreshing what's already there**, never for **showing it for the first time**.
+</Callout>
+
+That contract changes what belongs on the critical path. Exercise data, training history, leaderboard rankings — none of those have any business depending on a network round-trip to display. If they did, the app would stop working the moment the network became unreliable. The cache isn't a performance optimization. It's the source of truth at startup. The network is the secondary, eventual-consistency layer that quietly catches the cache up later, when it's ready.
+
+So the question of *"what goes on the critical path"* stopped being an engineering question and became a product question: **what does the user have a right to see, even when everything else has failed?** The answer, every time, was: *"the thing they were already using yesterday."* Yesterday's data, served from disk, in 50 milliseconds, while a background sync quietly tries to bring it up to date.
+
+Speed was the byproduct. Reliability was the goal.
+
+**This is the move most performance work misses.** It treats slowness as a constraint to optimize around, when often slowness is just the most visible part of an unreliable dependency. Remove the dependency from the critical path, and the failure mode goes with it. The speed comes for free, because the work isn't there anymore.
+
 ## Why we chose this shape and not parallelization
 
 The final design has four phases. Each one only blocks the user for the work that actually has to finish before the next thing they see.
