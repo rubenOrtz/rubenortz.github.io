@@ -1,7 +1,9 @@
-# rubenortz.github.io
+# rubenortiz.tech
 
 Personal blog and technical docs by Rubén Ortiz Martín, deployed at
-[rubenortz.github.io](https://rubenortz.github.io).
+[rubenortiz.tech](https://rubenortiz.tech). Repo is `rubenOrtz/rubenortz.github.io`
+on GitHub for historical reasons (it bootstrapped as a `<user>.github.io` user
+page before the custom domain was registered).
 
 ## What this is
 
@@ -58,9 +60,23 @@ the full fumadocs notebook layout (TOC, code blocks, hover cards).
 
 ## Custom domain
 
-When Rubén buys a domain, drop a `public/CNAME` file containing the apex
-or subdomain (one line, no protocol). Next.js copies `public/` straight
-into the build output, so GitHub Pages picks it up on the next deploy.
+Configured as `rubenortiz.tech` via `public/CNAME` (apex, one line, no
+protocol). Next.js copies `public/` straight into the build output, so
+GitHub Pages picks it up on every deploy.
+
+DNS records (configured at the domain registrar, not in this repo):
+
+```
+A     @      185.199.108.153
+A     @      185.199.109.153
+A     @      185.199.110.153
+A     @      185.199.111.153
+CNAME www    rubenortz.github.io.
+```
+
+GitHub Pages auto-issues a TLS cert via Let's Encrypt once DNS resolves.
+Enable "Enforce HTTPS" under repo Settings → Pages after the cert is
+provisioned (usually within 10-30 minutes of DNS propagation).
 
 ## What got stripped from the upstream template
 
