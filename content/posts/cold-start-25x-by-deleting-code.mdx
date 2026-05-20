@@ -1,6 +1,6 @@
 ---
 title: "Our Flutter app started in 7 seconds. The fix wasn't to make it faster."
-description: "How we went from 7.4s cold start to 294ms — by removing scaffolding instead of optimizing code. A story about the wrong plan, four bumps along the way, and what we learned to look for next time."
+description: "How we went from 7.4s cold start to 294ms — by removing scaffolding instead of optimizing code. A story about the wrong plan, five bumps along the way, and what we learned to look for next time."
 date: 2026-05-20
 ---
 
@@ -10,7 +10,11 @@ We finally fixed it. Cold start is now **294 milliseconds**. Twenty-five times f
 
 The fix wasn't a performance optimization. It was learning that most of the work the app was doing on startup wasn't startup work — it was scaffolding we had kept building because we'd forgotten we could stop.
 
-This post is about the path between those two facts. It's about the wrong plan we started with, the four bumps we hit along the way, and what we ended up doing instead. If you're not an engineer, none of this should feel inaccessible — the technical detail is the texture, not the point.
+<Callout title="What this post is" type="info">
+A story about the wrong plan we started with, the five bumps we hit along the way, the sentence that ended the search, and what we'd want you to take from it — even if you don't write code.
+
+The technical detail is the texture, not the point.
+</Callout>
 
 ## What we thought we were going to do
 
@@ -20,7 +24,7 @@ This was a defensible plan. It would have worked, in the sense that the code wou
 
 I'll come back to why.
 
-## The first bump: the tests passed before, and failed after, but nothing the user could see had changed
+## The first bump: the tests passed before, and failed after — but nothing the user could see had changed
 
 The startup pipeline had tests. Hundreds of them. They asserted things like *step 3 is wrapped in this kind of helper*, and *the factory returns the right configuration for guest users*, and *step #7 fires before step #2*.
 
@@ -64,13 +68,17 @@ I won't tell you how long it took us to find this. I'll tell you what we did the
 
 This is the bump I'll remember longest. Buried at the bottom of `main.dart`, after every initialization had completed, there was this:
 
-```dart
-Future<void>.delayed(const Duration(milliseconds: 2000), () {
+<Callout title="The smoking gun" type="warn">
+
+```dart title="main.dart"
+Future<void>.delayed(const Duration(milliseconds: 2000), () { // [!code highlight]
   FlutterNativeSplash.remove();
 });
 ```
 
 A hardcoded two-second delay before removing the splash screen.
+
+</Callout>
 
 I don't know who wrote it. I know it predated me by a long time. I can guess the story: at some point, startup didn't always finish before the app tried to render its first frame, and the user would briefly see something broken — a flash of white, an unstyled state, a missing image. So someone added two seconds of padding to make the bad case impossible. Forever.
 
@@ -102,7 +110,9 @@ The pattern isn't specific to A/B tests, either. It's any temporary thing — a 
 
 After a week of *"okay but why is this slow too"*, I stopped trying to parallelize anything and asked a different question:
 
-> What does the app actually need before it can show the user **anything**?
+<Callout title="The question that changed everything" type="info">
+What does the app actually need before it can show the user **anything**?
+</Callout>
 
 The answer surprised me. The app needs to know one of three things, all the time: take the user to their training, take them to a login screen, or take them to onboarding. That's it. *Everything* else — exercise data, payment status, leaderboard rankings, analytics, notification setup, animation runtimes — is either not needed for the first frame, or already cached on the device from the last session.
 
@@ -110,18 +120,31 @@ The routing decision is a piece of data, not a process. It doesn't need the netw
 
 This is the only sentence in this post that I really want you to remember:
 
-> The goal stopped being "do startup faster". It became "do less startup."
+<Callout title="The reframe">
+The goal stopped being *"do startup faster"*. It became *"do less startup."*
 
 That's the difference between a performance optimization and an architectural realization. The first one makes the wrong thing faster. The second one notices that most of the wrong thing didn't need to be there.
+</Callout>
 
 ## Why we chose this shape and not parallelization
 
 The final design has four phases. Each one only blocks the user for the work that actually has to finish before the next thing they see.
 
-1. **Resolve the destination.** The only blocking work. Runs on data already on the device. About 50 milliseconds.
-2. **Hydrate the local caches.** Fast, because everything is already on disk.
-3. **Sync exercise data, leaderboards, training history — in the background.** The user is already looking at the screen when these run. If they fail, the app degrades gracefully — the user sees yesterday's data, not a broken screen.
-4. **Set up payments.** Happens after the first frame is on screen. Doesn't block anything the user can see.
+<Mermaid
+  chart="
+flowchart LR
+    A([User taps icon]) --> P1
+    subgraph Blocking [Blocking — the user waits]
+      direction TB
+      P1[Phase 1<br/>Resolve destination<br/>~50ms · from cache]
+      P2[Phase 2<br/>Hydrate local caches<br/>fast · from disk]
+      P1 --> P2
+    end
+    P2 --> Frame([First frame on screen])
+    Frame -. fire & forget .-> P3[Phase 3<br/>Sync data, rankings,<br/>training history]
+    Frame --> P4[Phase 4<br/>Payments setup<br/>after first frame]
+"
+/>
 
 We could have parallelized the old pipeline. It would have been faster. But it still would have done the same total amount of work, just in less time. The user would still have had to wait for *everything* before they saw *anything*.
 
@@ -135,28 +158,40 @@ Same device, same user, same build mode. Real-device benchmarks, not synthetic.
 
 | Metric | Before | After |
 | --- | --- | --- |
-| Cold start to home (iPhone) | 7,415 ms | 294 ms |
-| Cold start to home (Pixel 8) | 7,415 ms | 478 ms |
+| Cold start to home (iPhone) | 7,415 ms | **294 ms** |
+| Cold start to home (Pixel 8) | 7,415 ms | **478 ms** |
 | `main.dart` size | 264 lines | ~100 lines |
-| Net code change | — | +7,569 / −4,466 |
+| Net code change | — | +7,569 / **−4,466** |
 
 The 25× number is real. We measured it on the same physical phone, with the same user, on the same build. It's not a benchmark game — it's what the user sees the moment they tap the icon.
 
 But the 25× isn't the story. The story is everything that happened to get there.
 
-## What I'd want you to take from this, even if you don't write code
+## What I'd want you to take from this — even if you don't write code
 
 Five things, in order of usefulness.
 
-**The plan you start with is sometimes the trap.** *"Parallelize startup"* was a defensible plan. It would have made the wrong thing faster. The bigger move was to ask whether all that work needed to happen at all. This is true of refactors, but it's also true of strategies, products, even careers. The first framing you arrive at is rarely the one that survives contact with what's actually going on.
+<Cards>
+  <Card icon={<MapIcon />} title="The plan you start with is sometimes the trap">
+    *"Parallelize startup"* was a defensible plan. It would have made the wrong thing faster. The bigger move was to ask whether all that work needed to happen at all. This is true of refactors, but it's also true of strategies, products, even careers. The first framing you arrive at is rarely the one that survives contact with what's actually going on.
+  </Card>
 
-**Things that have been there forever are not, by default, load-bearing.** They're frequently the opposite — they're there because nobody had a reason to remove them, which is not the same as having a reason to keep them. This is the most under-applied insight in any organization I've worked in. Most cleanups don't require new judgment. They require permission to act on old judgment that was never followed through.
+  <Card icon={<LayersIcon />} title="Things that have been there forever are not load-bearing by default">
+    They're frequently the opposite — they're there because nobody had a reason to remove them, which is not the same as having a reason to keep them. This is the most under-applied insight in any organization I've worked in. Most cleanups don't require new judgment. They require permission to act on old judgment that was never followed through.
+  </Card>
 
-**The thing you're slightly embarrassed about is a clue, not a flaw.** The two-second apology in `main.dart` wasn't a sign of bad engineering. It was a sign of a system that didn't have the cycles to come back and revisit it. Codebases, products, processes, relationships — they all accumulate small acts of self-defense that nobody remembers were temporary. The fastest way to find them is to look for the thing that makes you wince a little when you read it.
+  <Card icon={<HeartCrackIcon />} title="The thing you're slightly embarrassed about is a clue, not a flaw">
+    The two-second apology in `main.dart` wasn't a sign of bad engineering. It was a sign of a system that didn't have the cycles to come back and revisit it. Codebases, products, processes, relationships — they all accumulate small acts of self-defense that nobody remembers were temporary. The fastest way to find them is to look for the thing that makes you wince a little when you read it.
+  </Card>
 
-**Anything that describes how something is arranged will fight changes to how it's arranged.** Tests that assert layout. Documentation that names specific tools. Org charts that grow into job descriptions. The more they describe the current shape, the more they resist the next shape. Describe behavior and outcomes instead. They survive reorganization.
+  <Card icon={<RouteIcon />} title="Anything that describes how something is arranged will fight changes to how it's arranged">
+    Tests that assert layout. Documentation that names specific tools. Org charts that grow into job descriptions. The more they describe the current shape, the more they resist the next shape. Describe behavior and outcomes instead. They survive reorganization.
+  </Card>
 
-**The work nobody will notice is the work worth doing.** Nobody opens a fitness app and says *thanks for the 25× startup*. There's no launch announcement for "we removed scaffolding." But the team is faster. The codebase is smaller. The app stops asking the user to wait. That's a worthwhile thing to do quietly. Most worthwhile things are.
+  <Card icon={<EyeOffIcon />} title="The work nobody will notice is the work worth doing">
+    Nobody opens a fitness app and says *thanks for the 25× startup*. There's no launch announcement for "we removed scaffolding." But the team is faster. The codebase is smaller. The app stops asking the user to wait. That's a worthwhile thing to do quietly. Most worthwhile things are.
+  </Card>
+</Cards>
 
 ---
 
