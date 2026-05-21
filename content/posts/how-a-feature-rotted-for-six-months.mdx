@@ -8,7 +8,11 @@ A user wrote to us. *"My exercise rankings are gone."* Then another one. Then an
 
 We dug into it. The bug, it turned out, was six months old.
 
-This post is about how that's possible. About a cleanup that wasn't the bug but became the trigger. And about the seventeen lines of code that finally said *enough*.
+<Callout title="What this post is" type="info">
+A story about a frontend migration that quietly broke 22 of 24 user rankings for six months, a routine cleanup that wasn't the bug but became the trigger that exposed it, and the 17 lines that finally said *enough*.
+
+The technical detail is the texture, not the point. The lesson is for anyone who's ever shipped a "small cleanup" — what it might be hiding, and why what you find under it is rarely your cleanup's fault.
+</Callout>
 
 ## What the users were actually seeing
 
@@ -20,23 +24,23 @@ For months it worked. The user got their feedback, the app got its data, everybo
 
 ## What we shipped in November (the rot)
 
-In November the frontend swapped one endpoint for another. The team was migrating from `/rankings/exercises` (v1) to `/rankings/v2/exercises` (v2). The PR was framed as a UX improvement: when an exercise didn't have a rank yet, the new endpoint would let us *say so* instead of showing a broken state. Two rounds of review, a QA pass, merged.
+In November the frontend swapped one endpoint for another. The team was migrating from the old rankings endpoint to a new v2 version. The pull request was framed as a UX improvement: when an exercise didn't have a rank yet, the new endpoint would let us *say so* instead of showing a broken state. Two rounds of review, a QA pass, merged.
 
 Nobody on the PR named the contract change underneath. The two endpoints didn't carry the same catalog of exercises.
 
 <Callout title="The contract change nobody named" type="warn">
-v1 returned about **350 lookup tables**. v2 returned about **145**. The overlap was around 54 exercises. For a typical user with 24 trained exercises, **22 of those 24 didn't exist in v2.**
+The v1 endpoint returned about **350 lookup tables**. The v2 endpoint returned about **145**. The overlap was around 54 exercises. For a typical user with 24 trained exercises, **22 of those 24 didn't exist in v2.**
 </Callout>
 
-The change was invisible from the app's point of view because the app had a parallel layer of client-side flags — `hasMaleRankingData`, `hasFemaleRankingData` — that the screen actually trusted. Those flags had been written to local storage during older sync runs against v1. They kept saying yes. The screen kept rendering. The 22-of-24 gap was hidden behind a layer of stale-on-disk truth.
+The change was invisible from the app's point of view because the app had a parallel layer of local flags — a small piece of data, stored per exercise, that said *"this exercise has rank info"*. Those flags had been written to local storage during older sync runs against v1. They kept saying yes. The screen kept rendering. The 22-of-24 gap was hidden behind a layer of stale-on-disk truth.
 
 We didn't notice. The PR shipped clean. The app looked the same to users.
 
 ## What we shipped in March (the cleanup)
 
-Months later, users on an earlier release started complaining on our feedback channels: *"my rankings are gone."* The bug-report wave was bigger than the trickle we got in May — that's what triggered the investigation in the first place. The root cause this time wasn't the v2 catalog; it was the local-flag layer itself. During exercise syncs, the field merge wasn't preserving those `hasMaleRankingData` / `hasFemaleRankingData` flags. They were derived data being stored as if it were source data, and the merge logic was treating them as overwriteable.
+Months later, users on an earlier release started complaining on our feedback channels: *"my rankings are gone."* The bug-report wave was bigger than the trickle we got in May — that's what triggered the investigation in the first place. The root cause this time wasn't the v2 catalog; it was the local-flag layer itself. During exercise syncs, the field merge wasn't preserving those flags. They were derived data being stored as if it were source data, and the merge logic was treating them as overwriteable.
 
-We had two options. Option one: patch the merge to preserve the flags. Defensive, small. Option two: remove the flags entirely. Replace them with an on-demand check that reads the live lookup-table cache when the screen asks.
+We had two options. Option one: patch the merge to preserve the flags. Defensive, small. Option two: remove the flags entirely. Replace them with an on-demand check that reads the live cache when the screen asks.
 
 I argued for option two. Derived data masquerading as source data is a class-of-bug factory. Once you have the same fact in two places, every change becomes a question about which one wins. The longer you let the duplicate live, the more code accumulates around managing the disagreement. Cut the source of truth back to one. That's the refactor.
 
@@ -52,66 +56,66 @@ After the cleanup shipped, things looked fine for most users. The local lookup-t
 
 Until the user logged out.
 
-Logout calls a function whose only job is to wipe the local rankings cache. On the next login, the app re-fetches from `/rankings/v2/exercises` only. The 145 tables. Two of which match the user's training history.
+Logout calls a function whose only job is to wipe the local rankings cache. On the next login, the app re-fetches from the v2 endpoint only — the 145 tables. Two of which match the user's training history.
 
 The screen now correctly reports what v2 actually says: 22 of the user's 24 trained exercises have no rank data. Which is technically true. It's also a six-month-old regression finally telling the truth out loud.
 
-We started seeing the reports. The investigation took a couple of days of reading logs, comparing what the screen was showing to what the cache contained, and eventually — when the right person looked at it from the right angle — opening a terminal and hitting both endpoints directly with a valid auth token.
+We started seeing the reports. The investigation took a couple of days of reading logs, comparing what the screen was showing to what the cache contained, and eventually — when the right person looked at it from the right angle — opening a terminal and hitting both endpoints directly with a valid auth token and counting.
 
-<Callout title="The smoking gun">
-```
-GET /api/rankings/exercises     → 350 tables, covers 22/24 of user's trained exercises
-GET /api/rankings/v2/exercises  → 145 tables, covers  2/24
-```
+<Callout title="The smoking gun" type="warn">
+**The v1 endpoint:** 350 lookup tables. Covered 22 of the user's 24 trained exercises.
+
+**The v2 endpoint:** 145 lookup tables. Covered 2.
+
+Two terminal calls. One count. That was the bisection.
 </Callout>
 
-Two curls and a count. That was the bisection.
+## The whole timeline in one picture
+
+<Mermaid
+  chart="
+flowchart LR
+    Nov[November 2025<br/>Frontend swaps to v2 endpoint<br/>v2 catalog is ~60% smaller than v1]
+    Nov --> Mar[March 2026<br/>Cleanup removes the local flag layer<br/>The fossil cache that was hiding the gap]
+    Mar --> May[May 2026<br/>Logout/login wipes local cache<br/>Users see the true v2 catalog]
+    May --> Fix[17-line schema-version fix<br/>Forces one cache refresh, ever<br/>Then goes silent forever]
+"
+/>
+
+The bug shipped six months before anyone noticed. The cleanup that exposed it shipped two months before anyone noticed. The fix shipped the same day we noticed. Three teams, three releases, three months apart — none of them caused the bug. They just took turns making it visible.
 
 ## What the fix actually was
 
-The backend team would re-seed v2 with the missing exercise template IDs — that's the real fix, in a separate ticket. But seeding takes time, and even after it lands the app's local lookup-table cache has a multi-day TTL. Without our intervention, users would keep seeing the broken state until their cache happened to expire.
+The backend team would re-seed v2 with the missing exercise template IDs — that's the real fix, in a separate ticket. But seeding takes time, and even after it lands, the app's local cache has a multi-day TTL. Without our intervention, users would keep seeing the broken state until their cache happened to expire.
 
 I needed something different than a real fix. I needed a *trigger*. Something that, the moment the backend lands, makes every active client refetch once. After that: do nothing, forever.
 
 Seventeen lines.
 
-```dart title="rankings_repository_impl.dart"
-class ExerciseRankingsRepositoryImpl implements ExerciseRankingsRepository {
-  static const String _lookupTablesKey = 'ranking_lookup_tables';
-  static const String _lastFetchKey = 'ranking_last_fetch_time';
-  static const Duration _refreshInterval = Duration(days: 7);
+Two new constants — one is a label for a key we write to local storage, the other is a number we bump whenever the cache schema needs a global reset. One new branch in the function that decides whether to refresh the cache. The first time a client launches a build with the new schema version, the branch fires: it forces a refetch and writes the new version to local storage. On every subsequent launch, the constant is a no-op — the stored version already matches, the branch is skipped, the normal multi-day TTL takes over again.
 
-  // One-shot cache invalidation: forces every client to refetch once
-  // the first time they launch a build with _currentSchemaVersion >= 1.
-  // Bump the constant the next time a backend contract changes underneath
-  // the cache and the world needs to refetch.
-  static const String _schemaVersionKey = 'ranking_lookup_schema_version'; // [!code highlight]
-  static const int _currentSchemaVersion = 1;                              // [!code highlight]
-
-  // ... rest of the class unchanged ...
-
-  Future<bool> _needsRefresh() async {
-    final SharedPreferences prefs = await SharedPreferences.getInstance();
-
-    final int storedSchemaVersion = prefs.getInt(_schemaVersionKey) ?? 0;  // [!code highlight]
-    if (storedSchemaVersion < _currentSchemaVersion) {                     // [!code highlight]
-      await prefs.setInt(_schemaVersionKey, _currentSchemaVersion);        // [!code highlight]
-      return true;                                                         // [!code highlight]
-    }                                                                      // [!code highlight]
-
-    final int? lastFetchMillis = prefs.getInt(_lastFetchKey);
-    // ... fall through to the existing TTL check ...
-  }
-}
-```
-
-That's the whole change. Two constants. One branch in the function that decides whether to refresh the cache. Three properties hold:
+Three properties hold:
 
 - Every user pays the forced-refetch cost **exactly once**, the first launch on a build with the new schema version.
-- After that, the constant is a no-op. It can sit in the codebase forever with zero footprint.
+- After that, the branch is dead weight. It can sit in the codebase forever with zero footprint.
 - The next time we need to invalidate the cache again, we bump the constant from `1` to `2`. Same one-shot, new semantics. Reusable.
 
-The PR description was longer than the diff. That's not by accident. **The change is small precisely because the decision record is big.** Everything the reader needs to know in order to leave this code alone forever is written above the code.
+The pull request description was longer than the diff. That's not by accident. **The change is small precisely because the decision record is big.** Everything the reader needs to know in order to leave this code alone forever is written above the code.
+
+## The numbers (at the end, where they belong)
+
+| Metric | Value |
+| --- | --- |
+| Lookup tables in the v1 endpoint | ~350 |
+| Lookup tables in the v2 endpoint | ~145 |
+| Overlap between v1 and v2 catalogs | ~54 |
+| User's trained exercises in the test profile | 24 |
+| Rankings visible after logout/login on the broken build | **2 of 24** |
+| Time the regression sat undetected in production | **~6 months** |
+| Lines in the fix | **17** |
+| Files touched | 1 |
+
+The number that really matters is the 6 months. Everything else is a side effect of how good the masking layer was at keeping that number quiet.
 
 ## The deeper why — caches that lie are worse than caches that fail
 
