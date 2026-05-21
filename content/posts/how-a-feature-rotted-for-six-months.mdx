@@ -1,0 +1,160 @@
+---
+title: "How a feature rotted in plain sight for six months — and the 17 lines that brought it back"
+description: "How a frontend migration silently dropped 22 of 24 user rankings, a routine cleanup made the lie audible, and what it taught me about caches that quietly tell you what you want to hear."
+date: 2026-05-21
+---
+
+A user wrote to us. *"My exercise rankings are gone."* Then another one. Then another. They had different phones, different versions of the app, different routines. But they all described the same thing: after logging out and back in, where the app used to show their rank for twenty-four exercises, now it showed two.
+
+We dug into it. The bug, it turned out, was six months old.
+
+This post is about how that's possible. About a cleanup that wasn't the bug but became the trigger. And about the seventeen lines of code that finally said *enough*.
+
+## What the users were actually seeing
+
+Until that week, the app had been showing the same rankings every time you opened it — even on a cold install, even after a logout, even on a flight. The "Ranks" screen would load with your historical rank for every exercise you'd ever done.
+
+That was a lie. A polite one. The data the screen was reading wasn't being kept fresh by the server. It was being kept fresh by a layer of local flags the app had written to disk months earlier. Those flags said *"this exercise has rank data."* The screen trusted them. The user trusted the screen.
+
+For months it worked. The user got their feedback, the app got its data, everybody was fine. And then we ran a cleanup that removed the layer that had been lying.
+
+## What we shipped in November (the rot)
+
+In November the frontend swapped one endpoint for another. The team was migrating from `/rankings/exercises` (v1) to `/rankings/v2/exercises` (v2). The PR was framed as a UX improvement: when an exercise didn't have a rank yet, the new endpoint would let us *say so* instead of showing a broken state. Two rounds of review, a QA pass, merged.
+
+Nobody on the PR named the contract change underneath. The two endpoints didn't carry the same catalog of exercises.
+
+<Callout title="The contract change nobody named" type="warn">
+v1 returned about **350 lookup tables**. v2 returned about **145**. The overlap was around 54 exercises. For a typical user with 24 trained exercises, **22 of those 24 didn't exist in v2.**
+</Callout>
+
+The change was invisible from the app's point of view because the app had a parallel layer of client-side flags — `hasMaleRankingData`, `hasFemaleRankingData` — that the screen actually trusted. Those flags had been written to local storage during older sync runs against v1. They kept saying yes. The screen kept rendering. The 22-of-24 gap was hidden behind a layer of stale-on-disk truth.
+
+We didn't notice. The PR shipped clean. The app looked the same to users.
+
+## What we shipped in March (the cleanup)
+
+Months later, users on an earlier release started complaining on our feedback channels: *"my rankings are gone."* The bug-report wave was bigger than the trickle we got in May — that's what triggered the investigation in the first place. The root cause this time wasn't the v2 catalog; it was the local-flag layer itself. During exercise syncs, the field merge wasn't preserving those `hasMaleRankingData` / `hasFemaleRankingData` flags. They were derived data being stored as if it were source data, and the merge logic was treating them as overwriteable.
+
+We had two options. Option one: patch the merge to preserve the flags. Defensive, small. Option two: remove the flags entirely. Replace them with an on-demand check that reads the live lookup-table cache when the screen asks.
+
+I argued for option two. Derived data masquerading as source data is a class-of-bug factory. Once you have the same fact in two places, every change becomes a question about which one wins. The longer you let the duplicate live, the more code accumulates around managing the disagreement. Cut the source of truth back to one. That's the refactor.
+
+A teammate implemented it. A reviewer signed off after three small comments. It shipped in March, clean.
+
+From the outside, it was a good cleanup. **It was a good cleanup.**
+
+What we didn't see at the time: those local flags were also functioning as a *mask*. They told the screen an exercise had rank data even when v2 didn't carry that exercise. Removing them stopped the lie. It also exposed the v1→v2 gap that had been hiding behind it for six months.
+
+## What got exposed in May
+
+After the cleanup shipped, things looked fine for most users. The local lookup-table cache was a mixture of leftover v1 data and freshly-fetched v2 data. The on-demand check would still find v1 entries in the cache and report rank data for most exercises. Business as usual.
+
+Until the user logged out.
+
+Logout calls a function whose only job is to wipe the local rankings cache. On the next login, the app re-fetches from `/rankings/v2/exercises` only. The 145 tables. Two of which match the user's training history.
+
+The screen now correctly reports what v2 actually says: 22 of the user's 24 trained exercises have no rank data. Which is technically true. It's also a six-month-old regression finally telling the truth out loud.
+
+We started seeing the reports. The investigation took a couple of days of reading logs, comparing what the screen was showing to what the cache contained, and eventually — when the right person looked at it from the right angle — opening a terminal and hitting both endpoints directly with a valid auth token.
+
+<Callout title="The smoking gun">
+```
+GET /api/rankings/exercises     → 350 tables, covers 22/24 of user's trained exercises
+GET /api/rankings/v2/exercises  → 145 tables, covers  2/24
+```
+</Callout>
+
+Two curls and a count. That was the bisection.
+
+## What the fix actually was
+
+The backend team would re-seed v2 with the missing exercise template IDs — that's the real fix, in a separate ticket. But seeding takes time, and even after it lands the app's local lookup-table cache has a multi-day TTL. Without our intervention, users would keep seeing the broken state until their cache happened to expire.
+
+I needed something different than a real fix. I needed a *trigger*. Something that, the moment the backend lands, makes every active client refetch once. After that: do nothing, forever.
+
+Seventeen lines.
+
+```dart title="rankings_repository_impl.dart"
+class ExerciseRankingsRepositoryImpl implements ExerciseRankingsRepository {
+  static const String _lookupTablesKey = 'ranking_lookup_tables';
+  static const String _lastFetchKey = 'ranking_last_fetch_time';
+  static const Duration _refreshInterval = Duration(days: 7);
+
+  // One-shot cache invalidation: forces every client to refetch once
+  // the first time they launch a build with _currentSchemaVersion >= 1.
+  // Bump the constant the next time a backend contract changes underneath
+  // the cache and the world needs to refetch.
+  static const String _schemaVersionKey = 'ranking_lookup_schema_version'; // [!code highlight]
+  static const int _currentSchemaVersion = 1;                              // [!code highlight]
+
+  // ... rest of the class unchanged ...
+
+  Future<bool> _needsRefresh() async {
+    final SharedPreferences prefs = await SharedPreferences.getInstance();
+
+    final int storedSchemaVersion = prefs.getInt(_schemaVersionKey) ?? 0;  // [!code highlight]
+    if (storedSchemaVersion < _currentSchemaVersion) {                     // [!code highlight]
+      await prefs.setInt(_schemaVersionKey, _currentSchemaVersion);        // [!code highlight]
+      return true;                                                         // [!code highlight]
+    }                                                                      // [!code highlight]
+
+    final int? lastFetchMillis = prefs.getInt(_lastFetchKey);
+    // ... fall through to the existing TTL check ...
+  }
+}
+```
+
+That's the whole change. Two constants. One branch in the function that decides whether to refresh the cache. Three properties hold:
+
+- Every user pays the forced-refetch cost **exactly once**, the first launch on a build with the new schema version.
+- After that, the constant is a no-op. It can sit in the codebase forever with zero footprint.
+- The next time we need to invalidate the cache again, we bump the constant from `1` to `2`. Same one-shot, new semantics. Reusable.
+
+The PR description was longer than the diff. That's not by accident. **The change is small precisely because the decision record is big.** Everything the reader needs to know in order to leave this code alone forever is written above the code.
+
+## The deeper why — caches that lie are worse than caches that fail
+
+Most of what we talk about as "caching" gets framed as a performance optimization. A way to make slow things appear fast. That's a thin description. A cache is also a **contract** — *"if the remote disagrees with me, here is how we decide who wins."*
+
+The local flags were a cache that had no such contract. They didn't reconcile with anything. They were derived data stored as source data, which means *they only ever knew what the past was*. When the past was true, they helped. When the past was wrong, they kept being confidently wrong.
+
+This is the failure mode that's worse than a cache miss. A cache that fails tells you it failed. A cache that lies tells you everything is fine while the system underneath rots.
+
+<Callout title="The contract every cache needs">
+The remote is the source of truth. The cache exists to speed up access to a recent snapshot of it. When local data outlives the assumption it was built on, the cache stops being a cache and becomes a museum.
+</Callout>
+
+And eventually somebody walks into the museum and asks where the live exhibit is.
+
+## What I'd want you to take from this — even if you don't write code
+
+<Cards>
+  <Card icon={<EyeOffIcon />} title="The cleanup isn't the bug. The cleanup is what stops the lie.">
+    When housekeeping breaks a feature, the housekeeping is rarely the cause. What it's removing is what was hiding the actual rot. The right response isn't to revert the cleanup. It's to find what the cleanup was masking.
+  </Card>
+
+  <Card icon={<ClockIcon />} title="The timing of the report isn't the timing of the bug.">
+    By the time a user notices, the bug has usually been in the system for months. The interesting question is rarely "what changed last week." It's "what changed *months ago* that we never had to look at because something else was covering for it."
+  </Card>
+
+  <Card icon={<LayersIcon />} title="Hidden bugs accumulate interest.">
+    A bug your codebase shows is one you fix. A bug your codebase hides is one that compounds — every decision you make on top of the hidden version is one more decision you'll have to unwind when it finally surfaces. The visible bug is the cheap kind.
+  </Card>
+
+  <Card icon={<HeartCrackIcon />} title="A cache that lies is worse than a cache that fails.">
+    Stale data presented as current is the most polite kind of broken. It smiles, it loads fast, it stays out of your way. Then a downstream cleanup pulls the mask and you discover the system has been quietly wrong about itself for half a year. Plan for it. Audit what your caches are claiming the world looks like.
+  </Card>
+
+  <Card icon={<RocketIcon />} title="The best engineering is the kind you can forget about.">
+    Seventeen lines you can leave in the codebase indefinitely without maintenance, that work once and then go silent — that's a better legacy than seventeen thousand lines that someone has to come back and rip out later. The bar for a senior fix isn't *clever*. It's *bounded*: the smallest piece of code that does exactly its job and asks nothing of the future.
+  </Card>
+</Cards>
+
+---
+
+The fix is shipped. The Ranks screen recovers the moment the backend re-seeds the catalog. The seventeen lines are still there, silent, forever waiting for the next time someone needs them.
+
+Nobody opened a thread to congratulate the team on a feature that started working again. Nobody opened one to complain when it had been broken either. That's how the most important kinds of bugs usually live and die — without a story, without a metric, without a chance for anyone to say *"well done."*
+
+Which is why somebody has to write the post.
