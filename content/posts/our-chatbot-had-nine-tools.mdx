@@ -1,6 +1,6 @@
 ---
-title: "Our chatbot had nine tools. We needed four."
-description: "The intuition that helps you design REST APIs makes you build the wrong tool surface for LLM agents. A story about a warning I missed, a metric I had to instrument before I'd believe it, and the four tools that replaced nine."
+title: "Our chatbot got smarter when we gave it fewer tools"
+description: "What top agentic platforms — Claude Code, the leading MCP-driven agents — knew that we didn't. A story about a teammate who said it before launch, about the model being a better decider than we'd been pre-deciding for it, and about cutting nine tools to four to make room for the model's own judgment."
 date: 2026-05-20
 ---
 
@@ -10,25 +10,25 @@ date: 2026-05-20
 
 The first version of our chatbot shipped with nine tools. *Read memory. Update memory. Read the user's profile. Search exercises. Get workout history. Get the user's saved workout plans. Get weight history. Get streaks. Look up help docs.* One tool per thing the chatbot might need. Each tool small, focused, well-typed, easy to reason about. Textbook API design.
 
-It also turned out to be wrong.
+It also turned out to be making our chatbot dumber.
 
-It took us about a week of beta to see why, another week to admit why, and a Saturday afternoon to fix. The new surface has four tools. The chatbot is faster, the agent loops less, and the model writes better answers — for reasons that aren't obvious until you watch how an LLM actually uses the tools you give it.
+It took us about a week of beta to see why, another week to admit why, and a Saturday afternoon to fix. The new surface has four tools. The chatbot is faster, the agent loops less, and — the part that surprised me most — *the model writes better answers*. Not just shorter latency. Better thinking. The kind of thinking it had been doing all along, but that we'd been crowding out by pre-deciding too much of the work on its behalf.
 
 <Callout title="What this post is" type="info">
-A story about a teammate who said *"you have too many tools"* before we launched, about my missing the intuition behind it, and about the eval pipeline that finally made me see what they'd seen for free.
+A story about a teammate who said before launch — *"look at Claude Code, look at the top agentic platforms, they use fewer tools, and that's exactly why the model gets to be smart"* — and about my missing the insight behind it. About the eval pipeline that finally made me see what they'd seen for free.
 
-About why the design discipline that builds great REST APIs is the wrong discipline when the consumer is an LLM agent. And about a reframe — *"granularity is a latency knob, not a code-organization choice"* — that applies to a lot more than tool surfaces.
+About a reframe that applies to a lot more than chatbots: **the model is a better decider than you are about what to do inside a tool**. Pre-deciding for it by handing it nine narrow tools is baking in your worse decisions. Letting it decide via four fat tools with arguments is letting it use the thing it's actually good at.
 </Callout>
 
 ## The intuition I didn't have
 
-Before launch, a teammate looked at the tool surface and said something like: *"this is going to make the chatbot slower. There are too many of them. They're doing one thing each."*
+Before launch, a teammate looked at the tool surface and said something like: *"this is going to make the chatbot slower and dumber. There are too many of them. Look at how Claude Code does this. The agentic tools that work best have fewer tools — fat composable ones that take arguments and let the model decide what to do inside them. You're handing it nine narrow tools and effectively pre-deciding the work for it. The model decides better than you do. You're cutting it off from the part it's good at."*
 
 I nodded. I disagreed without saying so. The tools were small and focused. Each one had a clear job. The interface was clean. *That was the discipline I'd learned as a backend engineer.* A REST API with twenty narrow endpoints is easier to reason about than one with three endpoints that take a `kind` parameter and switch on it. The fact that each tool returned one specific kind of data felt like a feature, not a bug.
 
 The teammate let it go. We shipped. The chatbot worked. For about a week.
 
-I want to be clear about one thing before the story continues, because the easy way to write this post would be to make the teammate look prescient and me look slow. The truth is more boring than that. They had an intuition I didn't have. Intuitions are pattern-matches from prior experience. They had built things for LLM agents before. I had built things for human developers. The two surfaces look the same from outside — both are *"here is a set of functions you can call"* — and the discipline transfers approximately *zero percent* between them. I just didn't know that yet.
+I want to be clear about one thing before the story continues, because the easy way to write this post would be to make the teammate look prescient and me look slow. The truth is more boring than that. They had an intuition I didn't have. Intuitions are pattern-matches from prior experience. They had spent time looking at how the best agentic platforms — Claude Code, the leading MCP-driven agents, Cursor's agent layer — actually shaped their tool surfaces, and noticed that the well-designed ones are consistently *smaller* than the obvious-design ones. I had built REST APIs for human callers and assumed the discipline transferred. It doesn't. I just didn't know that yet.
 
 The data was about to teach me, expensively.
 
@@ -49,7 +49,9 @@ A few days into the investigation, we sat down with the eval pipeline and an eve
 The pattern was hard to miss once we'd looked at twenty turns in a row:
 
 <Callout title="The reframe" type="info">
-A narrowly-scoped tool means the model has to combine *several* of them to answer one question. Each combination is a separate round-trip. Each round-trip is a chance for the model to wander, second-guess, or fall into a loop. Nine tools wasn't precision — it was nine opportunities for the agent to take the long way around.
+A narrowly-scoped tool means the model has to combine *several* of them to answer one question. Each combination is a separate decision *we'd made for it at design time* — we'd decided what the steps were by giving it nine separate doorways, and the model's only job was to walk through them in some order. The model wasn't being trusted to decide. It was being asked to perform our pre-decision.
+
+Nine tools wasn't precision. It was nine of our judgments substituted for one of its judgments. And ours weren't as good as its would have been.
 </Callout>
 
 The chatbot was asked *"what was my last workout?"* and would chain together: *get user's profile* (to check unit preferences), *get workout history* (to find the last session), *search exercises* (to get the canonical name of the exercise the user did), *get weight history* (to compare against prior sessions), and then — only then — start composing an answer. Five tool calls. Two seconds of latency each, on average. Ten seconds before the model had begun to write a single token of response.
@@ -136,19 +138,23 @@ Eval set: 296 generations on the same question bank, same user fixtures, before 
 
 Two numbers worth noting are the ones that *didn't* move. The user-thumb-up rate on responses didn't change. The accuracy of the responses, by the eval judge, didn't change. We didn't trade quality for speed. We removed steps that weren't producing any quality in the first place.
 
-## The deeper why — agents are not callers
+## The deeper why — the model is the smarter party
 
-The most useful way I've found to think about this whole episode is that **an LLM agent is not a caller, it's a planner**.
+The most useful way I've found to think about this whole episode is that **the model is a better decider than you are about what to do inside a tool, and pre-deciding for it is the lazy answer.**
 
-When a human developer calls your API, the developer has a plan in their head. They wrote that plan before they wrote the call. The API's job is to expose primitives the developer can compose; the composition is the developer's responsibility.
+When a human developer calls your API, the developer has a plan in their head. They wrote that plan before they wrote the call. The API's job is to expose primitives the developer can compose; the composition is the developer's responsibility, and the developer is good at it — they have full context, they can reason about side effects, they can step through code.
 
-When an LLM agent calls your API, the agent *is* the plan. The plan is happening one call at a time, conditioned on the results of every previous call. Every primitive you expose is another branch the agent has to consider at every step. The cost of considering branches is the cost of running the model. The cost of running the model dominates everything else.
+When an LLM agent calls your API, the agent is not composing primitives. The agent *is* the plan, the planner, *and* the executor — all happening one call at a time, conditioned on the results of every previous call. The agent has more context about the user's question in this moment than you had at API design time. It has a stronger model of what makes a good answer. And it has the actual data of the previous turn's result in front of it, which is information you don't have when you're drawing tool surfaces on a whiteboard.
 
 <Callout title="The contract a tool surface enforces">
-For human-consumed APIs, granularity is a feature — it gives the caller control. For agent-consumed APIs, granularity is a cost — it gives the agent more decisions to make. The right surface for an agent is the smallest set of tools that covers the user's intents, with each tool fat enough to answer one question in one call.
+The right surface for an agent is the smallest set of fat tools that covers the user's intents, with each tool taking arguments rich enough that the model can decide what's inside it. Anything finer is you pre-deciding work on the model's behalf — and you're worse at deciding it than the model is.
+
+Don't structure for the model. Structure *around* it. Let it do the part it's good at.
 </Callout>
 
-This is the kind of design taste that doesn't transfer from a portfolio of REST APIs. It's not in the textbooks because the textbooks were written before the textbook readers were also calling the API. You learn it by watching an agent loop, the same way you learn most things in systems work — by instrumenting the thing, sitting down with the data, and letting the data tell you what you were doing.
+This is the design taste the teammate had that I didn't. It's the taste that the best agentic platforms — Claude Code, the leading MCP-based agents, Cursor's agent layer — have built in as a first principle. You don't see ten narrow tools in any of those. You see a small set of fat ones, each with rich arguments, each trusting the model with the decisions that don't have to be made up-front. That's not laziness in their tool surface. That's confidence in their model.
+
+It's not in the textbooks because the textbooks were written before the textbook readers were also calling the API. You learn it by watching an agent loop, the same way you learn most things in systems work — by instrumenting the thing, sitting down with the data, and letting the data tell you what you were doing.
 
 ## What I'd want you to take from this — even if you don't write code
 
@@ -161,8 +167,8 @@ This is the kind of design taste that doesn't transfer from a portfolio of REST 
     The teammate who said *"you have too many tools"* wasn't going to stop the release over it. They flagged it once and moved on. That's how almost all senior intuitions get communicated in fast-moving teams. The lesson isn't *"listen harder"* — it's *"build the measurement that would have proved them right, so the data does the convincing for you next time"*.
   </Card>
 
-  <Card icon={<RouteIcon />} title="Granularity is a cost, not just an organization choice.">
-    Every primitive you expose to a caller — whether human or agent or human-via-form — is another decision the caller has to make. For some callers (human devs writing thoughtful code) granularity gives them control and is a feature. For other callers (agents making one decision at a time, anyone in a hurry) granularity is a tax. Match the granularity to the caller.
+  <Card icon={<RouteIcon />} title="Pre-deciding for the smarter party is the lazy answer.">
+    Every narrow tool you expose to an LLM is a decision you've made on its behalf — usually because narrowness *feels* like clean engineering. But the model decides better than you do about what to do inside a tool, given enough context. Stop substituting your judgment for the model's. Give it fewer doors and trust it to figure out what's inside.
   </Card>
 
   <Card icon={<ActivityIcon />} title="Instrumentation eats arguments.">
