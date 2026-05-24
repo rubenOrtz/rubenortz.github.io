@@ -1,6 +1,6 @@
 ---
-title: "Our chatbot took 17 seconds to say 'you're welcome' — until we stopped asking the expensive model"
-description: "How a small front-router cut response time by 77% on smalltalk and 70% on simple questions, without touching the answer quality. A story about the model that doesn't need to see your message."
+title: "We made our chatbot faster by taking decisions away from the expensive model"
+description: "The architecture pattern hiding underneath the obvious 'use a cheaper model for easier questions' answer. About separating planning from execution, about pre-planning the executor's work so it converges in one pass, and about cutting the agent loop based on data instead of on what the model thinks. Every question class got faster — including the hard ones."
 date: 2026-05-18
 ---
 
@@ -8,118 +8,125 @@ A user sends a message to our chatbot: *"gracias"*.
 
 Seventeen seconds later, the chatbot replies: *"de nada, ¿hay algo más en lo que pueda ayudarte?"*
 
-Three things happened during those seventeen seconds. None of them needed to.
+The same chatbot, asked a harder question on a different day — *"explain why my deadlift programming has plateaued for three weeks"* — takes about thirty-eight seconds before it starts to write. Different question, same machinery, similar wait. Whatever you asked, the chatbot did roughly the same kind of work, because the only thing it knew how to do was *think carefully and then act*.
 
-The user asked a question that any junior model could answer in a sentence. We sent it to the most expensive, slowest, most thoughtful model in the stack — the same one that takes its time reasoning through nutrition trade-offs and parsing weeks of training history. The model thought carefully about *"gracias"*, decided it was a polite acknowledgment, and produced a polite acknowledgment in return.
+The obvious fix here is the one everyone reaches for: route the easy questions to a cheaper, faster model, let the smart model handle the hard ones. We did that. It worked, in the way you'd expect — smalltalk became fast.
 
-This is a post about the routing layer we built so that question — and every question shaped like it — stopped passing through the wrong door.
+That's not the interesting part of this post.
+
+The interesting part is what we had to change about how the expensive model is *called* — even on the hard questions — so that everything got faster. *Including the hardest ones the small model can't touch.* The architectural pattern that did the work isn't "route easy stuff to a cheap model". It's *take decisions away from the expensive model, every time*, and put them somewhere cheap and fast where they belong.
 
 <Callout title="What this post is" type="info">
-A story about a chatbot that ran every message through the same slow reasoning model — including *"hi"* and *"thanks"* — because that's what shipped first and *"it worked"*. About the small router we added that decides which model each message deserves, and the response-time gains that came out of it. About a reframe that turns out to apply to a lot more than chatbots.
+A story about four architectural moves that compounded into a 60-77% latency cut across every class of question in our chatbot. About a reframe — *the most expensive model in the system should be the worst possible place for it to decide what work needs doing* — that generalizes well beyond chatbots.
+
+About a constant that worked for the old shape of the system and silently broke when the new shape arrived. And about a loop-cut based on data that I think more agentic systems should be doing and don't.
 
 The technical detail is the texture, not the point.
 </Callout>
 
-## What we'd shipped first
+## The system we'd shipped
 
-The first version of the chatbot did the obvious thing. One model. Every message — from *"gracias"* to *"explain why my deadlift programming has plateaued for three weeks"* — went to the same reasoning model, with the same time budget, with the same tool-loop budget, with the same instructions in the system prompt. Whatever the question, the same engine processed it.
+The first version of the chatbot did the obvious thing. One model. Every message — from *"gracias"* to *"explain why my deadlift programming has plateaued for three weeks"* — went to the same reasoning model. With the same time budget. With the same tool-loop budget. With the same instructions in the system prompt. Whatever the question, the same engine processed it.
 
 That model is excellent. It is also slow and expensive. It has to be — that's what reasoning costs. The reasoning model takes ten to twenty seconds to produce a thoughtful answer when the question deserves it. When the question doesn't deserve it, the model still takes ten to twenty seconds. It does not know what the question deserves. It just answers.
 
-For the first month of beta this was fine, in the way that "we have one MVP path that covers every case" is always fine for the first month of a beta. The chatbot worked. Users got their answers. Nobody was sending us complaints. The numbers we measured were the numbers we knew how to measure: did the answer fire, did the tool calls land, did the user thumb-up the response.
+What we measured was the surface: did the answer fire, did the tool calls land, did the user thumb-up the response. What we weren't measuring, until we started measuring it, was how the user *felt* typing *"hi"* and waiting seventeen seconds. Seventeen seconds is a long time. It is also five seconds longer than the system prompt takes to transmit across the network. So the model wasn't even thinking for most of it — it was just being patient about its own thoughtfulness.
 
-What we weren't measuring, until we started measuring it, was how it *felt* to type *"hi"* and wait. Seventeen seconds is a long time to wait for a model to acknowledge you. It is also five seconds longer than the system prompt's content takes to be transmitted across the network. So the model wasn't even thinking for most of it — it was just being patient about its own thoughtfulness.
-
-## The reframe — one sentence
-
-We had a baseline of around 2,700 messages across two weeks. The median time-to-first-response on what we'd labeled "smalltalk" — *gracias*, *hola*, *ok*, *vale* — was about seventeen seconds. The median on "definition-style" questions (*"what is RPE?"*, *"what is hypertrophy?"*) was about sixteen seconds. The median on actual analytical questions (*"how was my last workout?"*, *"give me feedback on my routine"*) was about thirty-eight seconds.
-
-The pattern in the numbers is obvious once you let it sit for a minute:
+The pattern in the data was hard to miss once we let it sit:
 
 <Callout title="The reframe" type="info">
-The most expensive model in the stack was answering *every* question at roughly the same speed — because the work it does is invariant to the question. *"Gracias"* and *"give me feedback on my routine"* took the same kind of thinking, the same tool budget, the same wind-up.
+The most expensive model in the stack was doing *both* the planning ("what is this question asking? what tool should I call? what should I do with the result?") *and* the execution ("here is the carefully-reasoned answer to that question") for every single message. The work was invariant to the question because the *deciding* was invariant — the same expensive model was being asked to decide every time, no matter how trivial the decision.
 
-That meant we weren't getting slower on the hard questions. We were getting *the same speed* on the easy ones.
+The fix wasn't to make the reasoning model faster. The fix was to take the *deciding* away from it.
 </Callout>
 
-The fix wasn't to make the reasoning model faster. The fix was to stop asking the reasoning model questions it had no business being asked.
+That sentence sounds small. It produced four architectural moves that, together, changed the cost curve of every call to the expensive model — not just the trivial ones.
 
-## The first bump — *"smalltalk just goes to a small model, easy"*
+## Move 1 — split the planner from the executor
 
-The first attempt was the obvious one. We added a small *Phase 1* shortcut at the top of the pipeline: if the message matches a tight set of patterns — bare greetings, bare thank-yous, bare acknowledgments — route it directly to a smaller, faster model and skip the entire tool-loop. Don't even build the system prompt context. Don't even let the reasoning model see the message.
+The first architectural move is the one that frames everything that comes after. Instead of one expensive model that *decides what to do* and *does it* in the same call, we now have **two models, with different responsibilities and very different cost profiles**.
 
-This is one of those changes that feels like it should obviously work and obviously will keep working. Smalltalk is bounded. There are maybe twenty phrasings that count as *"hi"*. Match those, shortcut them, move on.
+The first is a small, fast classifier — a *planner*. Its only job is to look at the user's message and decide what should happen next. Should this question be answered directly by the planner itself? Should it be routed to the expensive model? If so, what kind of work does the expensive model need to do, and what tool — if any — should be queued ahead of it?
 
-In practice the cliff is sharper than you'd expect. The router has to *recognize* smalltalk reliably enough that it doesn't accidentally shortcut a real question. *"Hola"* on its own is smalltalk. *"Hola, ¿cómo afecta una carga del 70% al volumen efectivo de pierna?"* is absolutely not smalltalk. Substring matching fails immediately. So even the simplest shortcut isn't a regex — it's already a small model deciding which bucket the message lands in.
+The second is the same expensive reasoning model we already had — but now it's only an *executor*. It does the thoughtful reasoning we built it for. It does not decide whether thoughtful reasoning is the right move; that decision was already made before it got the message.
 
-Phase 1 was a strict, conservative version of that bucket-decider. It only triggered on the cleanest cases. Anything that looked even slightly like a real question fell through to the original expensive path. Median time-to-first-response on smalltalk dropped from around seventeen seconds to around four. We shipped it the same afternoon.
+Most descriptions of "routing" treat this as a sorting hat — *easy questions go here, hard questions go there, done*. That framing buries what's actually going on. The planner isn't sorting questions by difficulty. It's stripping the *deciding* step out of every call to the expensive model, so the expensive model never has to spend cycles working out what it's supposed to do. The hard questions still go to the expensive model. They just arrive with the planning already done.
 
-What it did *not* do was solve the cases that mattered more — the questions that aren't smalltalk and aren't analytical either. *"What is RPE?"* doesn't need reasoning. It needs a one-paragraph definition. It still went to the slow path.
+This is the architectural move that makes every other move in this post possible.
 
-## The second bump — classifying everything, not just smalltalk
+## Move 2 — pre-plan the executor's work via a directive
 
-Phase 1 made it clear that the right shape was *every message starts with a small, fast classification step*, not just the smalltalk cases. So Phase 2 was the same idea, generalized.
+Once you have a cheap planner that runs before every executor call, you can give it a much more useful job than "pick the right model". You can have it *write a brief for the executor*.
 
-The new router is the same small fast model. Its only job is to look at the message and decide which of a small set of *intent classes* it belongs to. The classes are deliberately coarse — a handful, not dozens. Each class has a route: *answer it yourself*, *send it to the reasoning model with a pre-planned directive about what to do*, *send it to the reasoning model with no pre-planning because it really is open-ended*.
+When the planner decides a question is going to the expensive model, it doesn't just route it. It writes a short directive — usually under two hundred characters — that tells the executor what to focus on. *"User is asking about their squat 1RM progression. Last six weeks of training data should be sufficient. Focus on weekly load and rep-range variation; do not call the weight-history tool."* That's the directive. It rides along with the question.
 
-For the in-between classes — *"what is RPE?"*, *"what is hypertrophy?"* — the router can usually answer the question on its own. These are bounded definitional questions that any model trained on the public internet has a good answer for. The reasoning model is overkill for them and adds nothing the user notices. Median time-to-first-response on this class dropped from around sixteen seconds to around four.
+The executor, when it gets the message, doesn't have to figure out what's being asked, doesn't have to deliberate about which of its tools is the right first call, doesn't have to write an internal plan before it starts. The plan is already in front of it. It just executes against it.
 
-For the analytical class — the questions that genuinely need the reasoning model + the user's data — the router still routes there. But it does one more thing on the way: it writes a short *directive* for the reasoning model. *"User is asking about their squat 1RM history. Last six weeks of data should be sufficient. Focus on weekly load progression."* The reasoning model gets to skip the part where it figures out what tool to call first; the router has already told it. That alone shaved several seconds off the analytical path, because the reasoning model converges in fewer tool-loops.
+The cost of writing the directive is one fast call to the cheap model. The cost of *not* writing the directive used to be three or four loop rounds inside the expensive model: read the question, call a tool, look at the result, call another tool, look at that result, finally start writing. Each of those loop rounds is several seconds of reasoning model time. The cheap directive replaces several expensive deliberations.
 
-This isn't an optimization. It's a re-allocation. The router does the work the reasoning model used to do for free.
+This is the move that made the hard-question class faster, not just the easy one. The expensive model now does less work *per call*, because someone else did the work that didn't need its thinking horsepower.
 
-## The third bump — the crisis with max_tokens
+## Move 3 — cut the loop based on data, not on what the agent thinks
 
-Phase 2 shipped. It mostly worked. The smalltalk class held its four-second median. The definition class came in around five. The analytical class came in around fifteen — slower than smalltalk, faster than the original baseline. We started writing the recap.
+The third move is the one I'm most curious that more agentic systems don't do.
+
+The standard shape of a tool-using agent is: model decides what tool to call, calls it, looks at the result, decides what to do next. *The model decides everything, including when to stop*. The model is in the loop the entire time.
+
+There's a class of questions where that's overkill. *"What's my current training streak?"* is a question whose answer is one number, retrieved from one place, with no real reasoning required. In the original pipeline this still went to the reasoning model. The reasoning model would call a tool to fetch the user's training data, get back a payload, and then *think about it* for several seconds before reporting back a single number that was already sitting in the payload.
+
+The third architectural move was a *sufficiency check* sitting between the tool call and the next model round. After a tool returns, the planner glances at the result and asks one question: *is the answer to the user's question already in this payload?* If yes, the loop ends. The planner writes the response directly from the data, and the expensive model is never asked to weigh in.
+
+This is a *data-based loop interrupt*. The agent doesn't decide whether to stop reasoning — the system inspects the data and stops the loop for it. The expensive model never sees the message. The user gets their answer in the time it took to make a tool call and read its result.
+
+Lookups dropped from twenty-one seconds to nine in the same week we shipped this. The win didn't come from making the expensive model faster on lookups. It came from never calling the expensive model on lookups in the first place.
+
+## Move 4 — the cap that worked for the old shape and silently broke for the new one
+
+We shipped the three moves above. The numbers moved. Smalltalk became fast. Definitions became fast. Analytical questions became faster. We started writing the recap.
 
 Then a colleague pinged me to say the analytical class was sometimes returning *empty responses*. Not slow responses. Empty.
 
-I dug in. The reasoning model was being called. The reasoning model was finishing. The reasoning model was returning a payload with `finish_reason: length` and zero content tokens. We were asking for an answer, and the model was telling us *"I tried, but I ran out of room before I could say anything."*
+The reasoning model was being called. The reasoning model was finishing. The reasoning model was returning a payload with `finish_reason: length` and zero content tokens. We were asking for an answer, and the model was telling us *"I tried, but I ran out of room before I could say anything."*
 
-The bug was a single number. The reasoning model needs headroom to *think* before it produces output. Its reasoning tokens count against the same budget as its output tokens. We had set the max-tokens cap at 256, because that was enough for the original short answers the router-less version produced. After Phase 2 the reasoning model was sometimes spending 256 tokens just *thinking through* the directive the router had given it — and then it had zero tokens left to actually write the answer. The model was hitting the cap during the silent reasoning phase. The user got nothing back.
+The fourth architectural move was the smallest of the four, and the most embarrassing. We had a *max-tokens cap* in the calling code, sized for the original system. In the original system, the reasoning model did its planning and reasoning *implicitly*, in its output stream, mixed with the answer. A cap of 256 tokens covered everything it ever produced.
 
-We bumped the cap to 1024 and added a hard 12-second timeout. Empty responses dropped to zero. The 12-second timeout was the more interesting choice — it forced us to admit that the reasoning model occasionally just doesn't return, and that the right answer in those cases is to fall back gracefully rather than to make the user wait indefinitely.
+After moves 1–3, the reasoning model wasn't producing the same shape of output anymore. It was getting a directive that told it what to do, executing the work, and writing a tighter answer. But because it's a *reasoning* model, its thinking tokens still count against the same budget as its output tokens. With moves 1–3 the model was sometimes spending several hundred tokens *thinking* about the directive — and then hitting the cap before it could write anything. The model would say *"I tried, but I have no room left to speak."* The user got nothing back.
 
-I think about this bump the most. It's not a story about a clever fix. It's a story about a number that worked for one version of the system and silently became wrong when the system changed shape around it. There was no test that caught it because the test was checking *"does the response fire"*, not *"does the response contain anything"*. The cap was load-bearing in a way the original author of that line never thought to write down.
+We bumped the cap to a number large enough to cover the thinking *and* the answer with margin. The empty responses went to zero.
 
-## The fourth bump — the data was already in the room
-
-There's a particular shape of question users ask a fitness chatbot a lot. *"What's my current streak?"* *"How many sessions did I do last week?"* *"What was my heaviest lift this month?"* These look like analytical questions, but they're not. They're lookups. The answer is one number, retrieved from one place, with no reasoning required.
-
-In the original pipeline these still went to the reasoning model. The reasoning model would call a tool to fetch the user's training history, get back a payload of data, and then *think about it* for several seconds before reporting back a single number that was already in the payload.
-
-After Phase 2 we added one more thing: a *sufficiency check*. After the first tool call returns, the router glances at the result and asks: *"is this enough to answer the question directly?"* If yes, the loop ends — the router writes the answer from the data and returns. The reasoning model is never woken up.
-
-This is the cheapest optimization in the post. It's a single conditional on a path that was already going to run. It cut the lookup-question median from around twenty-one seconds to around nine. The reasoning model was being summoned to thoughtfully tell users a number we'd literally just handed it.
+I include this move because it's where the architecture story has its honest edge. **Constants that worked for the old shape of a system silently break when the shape changes.** A cap of 256 tokens is not load-bearing in the original system. It is the entire user experience in the new one. The mistake was not in the new architecture — it was in trusting a constant that had been set for a model of how the system used to work. There's a test for every architectural change that should pass and didn't: *does this assume any constants in the calling code that were sized for the old behavior?* We didn't think to ask.
 
 ## The architecture, in one picture
 
-By the time all four bumps were in, the shape was different enough that it's worth seeing:
+Once you put all four moves together, the shape is different enough that it's worth seeing:
 
 <Mermaid
   chart="
 flowchart TD
     M([User message])
-    M --> R{Small router<br/>classifies intent}
-    R -->|Smalltalk| F1[Small fast model<br/>answers directly]
-    R -->|Definition-style| F2[Small fast model<br/>answers from training]
-    R -->|Lookup-style| T[Tool call<br/>+ sufficiency check]
-    R -->|Analytical| Pre[Small router writes<br/>directive for big model]
-    T -->|Sufficient| F3[Small model writes<br/>answer from data]
-    T -->|Not sufficient| Pre
-    Pre --> RM[Big reasoning model<br/>+ tools<br/>+ 12s timeout]
-    F1 --> U([User])
-    F2 --> U
-    F3 --> U
-    RM --> U
+    M --> P{Planner<br/>cheap, fast model}
+    P -->|smalltalk| A1[Planner answers directly]
+    P -->|definition| A2[Planner answers directly]
+    P -->|lookup| Q[Queue: known tool +<br/>sufficiency hook]
+    P -->|analytical| D[Write directive<br/>for the executor]
+    Q --> T[Tool call]
+    T --> S{Is the answer<br/>in the payload?}
+    S -->|yes| A3[Planner writes response<br/>from the data]
+    S -->|no| D
+    D --> E[Executor: expensive<br/>reasoning model]
+    E --> A4[Reasoned response<br/>per directive]
+    A1 --> U([User])
+    A2 --> U
+    A3 --> U
+    A4 --> U
 "
 />
 
-The shape of the picture is the shape of the fix. The big reasoning model used to be the only door. Now it is *one door at the end of a corridor*, and most users never reach it.
+The expensive model is still in the picture — it's just no longer the entry point. Three of the four paths to the user don't touch it at all. The fourth one does, but it arrives with most of its work pre-decided. The planner does the deciding. The executor does the executing. The system inspects the data and cuts the loop when it has enough. None of these moves require touching the expensive model itself.
 
 ## The numbers (at the end, where they belong)
 
-Same beta cohort, same two-week measurement window before and after. Sample baseline: ~2,700 messages.
+Same beta cohort, same two-week measurement window before and after. Baseline: ~2,700 messages.
 
 | Question class | Before (median) | After (median) | Δ |
 | --- | --- | --- | --- |
@@ -128,45 +135,49 @@ Same beta cohort, same two-week measurement window before and after. Sample base
 | Lookup-style (*what's my streak?*) | ~21 s | ~9 s | **−57 %** |
 | Analytical (*feedback on my routine*) | ~38 s | ~15 s | **−60 %** |
 
-The number we expected to move was the smalltalk one. The numbers that surprised us were the lookup and analytical ones — both got faster *as a side effect* of the router pre-planning what to do.
+The two numbers worth dwelling on are the lookup row and the analytical row.
 
-We didn't make any single model faster. We just made sure the right model was the one being asked.
+The lookup row got fast because of **Move 3** — most lookups never reach the expensive model anymore. The system inspects the tool result, sees the answer is in it, and replies without another model call. The expensive model is still capable of answering those questions perfectly; it just never gets asked.
 
-## The deeper why — model choice is a contract, not an optimization
+The analytical row got fast because of **Move 2** — the expensive model *still* gets called on analytical questions, but it now arrives with a written directive about what to do. Most of what used to be expensive deliberation has been done upstream by a much cheaper model. Same executor, less work per call, twice as fast.
 
-When most engineers talk about "AI cost" or "AI latency," they tend to talk about it as a knob — the model is fixed, the costs are what they are, the latency is what it is, the only lever is asking the model less often. That framing leaves a lot of work on the table.
+We didn't make any individual model faster. We changed *who was deciding*.
 
-The reframe that actually moves the numbers is to stop thinking about *one* model and to start thinking about a *stack* of them. The stack has a small, fast, cheap model at the top that decides which other model — or no model at all — gets to do the actual work. The top model is the routing layer. Its job is to be the smallest entity that can correctly decide what the question deserves.
+## The deeper why — the expensive model is the worst place to put the decision
 
-<Callout title="The contract a router enforces">
-Every message deserves the *smallest* model that can answer it correctly. The router doesn't try to answer the question. It only decides which engine should.
+Most engineering writing about LLM performance talks about it the way you'd talk about a database query: there's a knob (model size), there's a cost (latency), and the trick is to call it less often. That framing leaves a lot of work on the table.
+
+The reframe that actually moves the numbers is to stop thinking about *one* model and to start thinking about *who's making each kind of decision* in your system. Some decisions are *what* decisions — what question is the user asking, what tool would help, what shape of answer is needed. Other decisions are *how* decisions — given the work is well-specified, how should I do it well.
+
+The expensive reasoning model is excellent at *how* decisions. It is overpriced and underqualified for *what* decisions, because *what* decisions need speed and breadth, not depth. Putting *what* decisions on the expensive model has the same shape as a senior engineer being asked to triage all incoming Jira tickets: they can do it, they'll do it correctly, and you'll have spent the most expensive person on your team to perform the cheapest cognitive work it has.
+
+<Callout title="The contract a planner-executor split enforces">
+The expensive model should never be the place where it gets decided whether the expensive model is the right tool. Put a fast cheap layer in front of it whose entire job is to answer *what work needs doing*, so the expensive layer only has to do the work it's actually good at.
 </Callout>
 
-This sounds like a small idea. It is not. It changes the cost profile of the entire product. Most user questions, in any conversational system, are not the questions the system was designed to answer well. They're greetings, acknowledgments, definitional asides, lookups. If those questions never reach the expensive model, the expensive model only has to be good at the small fraction of questions that genuinely deserve it. The economics flip from *"we pay for thoughtfulness on every message"* to *"we pay for thoughtfulness on every message that thoughtfulness improves"*.
-
-The same shape shows up in places that have nothing to do with AI. Cache layers in front of databases. Approval thresholds in expense reports. Triage steps before specialists in hospitals. Whenever there's an expensive resource that doesn't need to handle every request, somebody eventually puts a cheap classifier in front of it. The classifier is the architecture.
+The same shape shows up in places that have nothing to do with AI. The product manager who triages issues so engineers can stay heads-down. The dispatch nurse who decides who needs the ER and who needs the GP. The cache layer in front of a database. The build-and-cache step before a slow test suite. In every one of those, the system has split *deciding what to do* from *doing it*, and put them on different cost tiers. Once you see the pattern, you see it everywhere — and you see how often it's missing in agentic systems that have grown around a single expensive model.
 
 ## What I'd want you to take from this — even if you don't write code
 
 <Cards>
   <Card icon={<DoorOpenIcon />} title="The expensive resource should not be the only door.">
-    Whenever you have something that's expensive — a senior engineer, a meeting, a slow model, a multi-step legal process — the first design question is not *"how do we make it faster"*. It's *"what do we put in front of it so it only handles the cases that need it"*.
+    Whenever you have something expensive — a senior engineer, a meeting, a slow model, a multi-step legal process — the first architectural question is not *"how do we make it faster"*. It is *"what do we put in front of it so it only handles the cases that actually need it"*. Then: *"what can we hand to it pre-decided so it does less work per case"*.
   </Card>
 
-  <Card icon={<FilterIcon />} title="The smallest correct classifier is your highest-leverage component.">
-    The router doesn't answer the question. It only decides who should. That's a one-line job that, done well, governs the cost and latency of the entire system around it.
+  <Card icon={<SplitIcon />} title="Separate deciding from doing. Put them on different cost tiers.">
+    The expensive model is excellent at *how to do something well* and overpriced for *what should be done*. Pre-deciding *what* via a cheap fast layer lets the expensive layer do only the part it's actually good at. The cost curve changes for every call, not just the easy ones.
   </Card>
 
-  <Card icon={<HourglassIcon />} title="Numbers that worked for an old system become quiet bugs in a new one.">
-    A max-tokens cap of 256 was correct for the original system and silently wrong for the routed one. It would have shipped. Every system has these — constants that were load-bearing in a way nobody wrote down. The fix is to make the constants themselves visible, not to never set them.
+  <Card icon={<RouteIcon />} title="Pre-planning is cheaper than doing the work twice.">
+    A short brief written by a fast model — a directive, a triage note, a one-line summary of intent — saves the expensive layer from re-deriving its plan. That brief usually costs ten times less than the loop rounds it eliminates downstream. It's the smallest possible intervention with the largest secondary effect.
   </Card>
 
-  <Card icon={<RouteIcon />} title="Pre-planning the work is cheaper than doing the work twice.">
-    The router writing a directive for the reasoning model was the smallest possible intervention with the largest secondary effect. The reasoning model stopped re-deriving what to do, because someone had already told it. This pattern — *spend a cheap step pre-planning so the expensive step does less* — generalizes everywhere.
+  <Card icon={<ScissorsIcon />} title="Cut the loop based on data, not on what the agent thinks.">
+    Most agentic systems let the model decide when it has enough information to answer. That puts the *deciding when to stop* on the most expensive part of the system. A cheap inspector — looking at the data, asking *is the answer already here?* — can interrupt the loop before the model is consulted again. The model never sees the question; the user gets their answer faster anyway.
   </Card>
 
-  <Card icon={<EyeOffIcon />} title="Most of the win was invisible from the inside.">
-    Nobody on the engineering team felt the chatbot was slow. The complaints didn't come in. The product hadn't been launched at scale yet. We only saw the seventeen-second smalltalk because we sat down and looked at the distribution. The most actionable performance work usually lives in the data the team already collects but nobody has looked at this week.
+  <Card icon={<HourglassIcon />} title="Numbers sized for the old shape silently break in the new one.">
+    A max-tokens cap of 256 was correct for the original system and silently wrong for the routed one. It would have shipped. Every architectural change should ask: *does this assume any constants in the calling code that were sized for the old behavior?* Most architectures grow by adding shape and inheriting constants. The constants are how the old shape outlives its usefulness.
   </Card>
 </Cards>
 
