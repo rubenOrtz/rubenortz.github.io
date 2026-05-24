@@ -1,0 +1,179 @@
+---
+title: "Every new card in our chatbot was a breaking change. We made it stop."
+description: "How a reviewer's three-bullet comment turned into a schema-first wire protocol with dual-emit migration. A story about designing for the older clients you'll always have, and the named seam that absorbs the shape of every future change."
+date: 2026-05-24
+---
+
+*Part three (and last) of a three-post series on building Symmetry Intelligence. Previous posts: [the routing layer that cut chatbot latency by 77%](/posts/we-stopped-asking-the-smart-model-everything/) and [the nine-tool surface we collapsed to four](/posts/our-chatbot-had-nine-tools/). This one is the data-contract problem the previous two surfaced, and what we did so the next chatbot feature doesn't break the older mobile builds it'll have to coexist with.*
+
+---
+
+The chatbot shipped a new feature. When you asked about a specific exercise, the response sometimes included a small card at the bottom — a list of alternatives. Tap one, see the demo, swap it in. Clean UX. Small bit of polish.
+
+Building it took a day. The card was a new event type on the chat-stream wire — `exercise_alternatives_card` — emitted by the backend at the end of certain turns. The Flutter side added a renderer for it. We tested it end to end, shipped to beta, watched it work.
+
+It worked.
+
+It also quietly broke the chatbot on every mobile build that was even one release behind.
+
+Older versions of the app didn't know about `exercise_alternatives_card`. When they received the event, the parser didn't have a case for it. The Flutter code didn't crash — we'd hardened the parser against unknown events months earlier — but the user just got a blank space where the card should have been. The chatbot's prose answer was correct. The card was missing. Nobody on those builds saw anything wrong; they just got slightly less useful answers without knowing they were missing anything.
+
+This is a post about the change we made so that *adding the next card* — and the one after that, and the one after that — stopped being a breaking change. The fix wasn't to be more careful with our event names. The fix was to stop adding events at all.
+
+<Callout title="What this post is" type="info">
+A story about a wire protocol that was correct for the day we shipped it and quietly wrong every day after, about a reviewer's three-bullet comment that named the problem in a way I hadn't, and about a small architectural shape — *a single seam where polymorphism lives, with the rest of the system kind-agnostic* — that turns out to be the same shape behind a lot of long-lived systems.
+
+The technical detail is the texture, not the point.
+</Callout>
+
+## What the reviewer said
+
+We were preparing to ship the next card type — a rich workout summary, more structured than the alternatives card. The pull request was open for review. A reviewer left a comment with three bullets.
+
+The first one was small: *the wire names in the code didn't match the wire names in our Notion documentation anymore.* We'd renamed some events along the way; the doc hadn't caught up. A documentation chore.
+
+The second one was the one I almost missed: *every new visual you ship is a new SSE event, and every new SSE event is a breaking change for any mobile build older than this one.* They went on: the older clients have to know about every event type the backend might send, and if the backend sends one they don't recognize, the user silently loses something. That's not a parser bug. That's a *protocol design* problem.
+
+The third one was the one that turned the comment from a code review into a design review: *the right thing here is probably a machine-readable contract — something the frontend and backend can both code-generate from, with a polymorphic envelope, so that adding a new card type doesn't require the old client to know it exists.* They didn't write code. They didn't propose a specific schema. They just pointed at the shape.
+
+I read the comment three times. The first time I disagreed with it — the parser was hardened, the unknown events fell through, the worst case was a missing card, not a crash. The second time I started to see it from the user's side — a user with a slightly older build gets a worse answer and never knows. The third time I saw it from the design side — *every product feature we ship from now on is going to either be a breaking change or be designed around this constraint*. That's a future-tax we'd just signed up for, indefinitely, by treating wire shape as a thing you grow event by event.
+
+I closed the PR for the workout summary card and rebooked the work. The reviewer's three bullets were the spec.
+
+## The shape we'd built
+
+It's worth being precise about what the original protocol looked like, because the design mistake isn't obvious if you just describe it as *"we used SSE events"*.
+
+Server-sent events carry a stream of named messages. Each message has a *type* (a string) and a *payload* (JSON). The frontend parses each message and dispatches on the type. The chatbot used this for everything that wasn't plain text: a `status` event when the model started thinking, a `tool` event when it called a backend tool, a `reasoning` event when it produced internal reasoning, a `content` event for each chunk of the streamed text answer. So far, so standard.
+
+When we added the first card, we added a new event type for it: `workout_card`. The frontend learned to recognize the new type and render the card. When we added the second card, we added `exercise_alternatives_card`. Frontend learned that one too. Each new card type was *its own event*, with its own payload schema, hand-coded into the parser on both sides.
+
+This works exactly once. It works the second time. The third time you start to feel the trap: every new card requires a parser change on the frontend, and that parser change has to ship in a new mobile build, and *until that build is on every user's phone*, the backend has to either not emit the new card (and lose the feature for everyone) or emit it knowing the older clients will silently drop it (and quietly degrade the experience for some users without telling them).
+
+The reviewer's second bullet was the cost of this in one sentence: **every new visual is a breaking change**. We didn't notice this with the first card because there was nothing older for it to break against. We didn't notice it with the second card because the breakage was silent. By the third card it would have been impossible not to notice.
+
+## The reframe — one sentence
+
+We rebooked the work. The first thing we agreed on, before any code, was the shape:
+
+<Callout title="The reframe" type="info">
+Instead of adding a new event type for every new card, send *one* event type — call it `ui_block` — that carries a *kind* and a *version* and a *payload*. The frontend dispatches on kind+version, not on event type. New card types arrive as new kinds inside the same envelope. Old clients see a `ui_block` they don't recognize, fall back to a text representation, and keep working.
+
+The wire stops growing. The kinds grow. The wire is the contract; the kinds are the product.
+</Callout>
+
+This is a small idea with a lot of structural implications. The wire format stops being something the frontend has to keep parsing-updated against; it becomes something the frontend can compile *once* and rely on. The work of "knowing about every kind that exists" moves from the parser to a *renderer registry* — a map from `kind+version` to a render function — that can be safely missing entries without breaking the parser. Missing renderer? Use the text fallback. Don't drop anything; just render less.
+
+The reviewer's third bullet — *machine-readable contract* — was the same idea from a different angle. If the wire is one event with a structured envelope, and each kind has a known schema, then both sides can generate their types from a single source. We wrote the contract in AsyncAPI 2.6 (the SSE-native specification) with one JSON Schema per kind. The backend validates outgoing messages against the contract. The frontend has types generated from the same contract. The contract is in version control; changes to it go through review like any other code.
+
+## The bumps along the way
+
+I want to be honest about what didn't go smoothly, because the schema-first sketch above sounds tidier than the work was.
+
+### The text fallback was the hardest part
+
+The simplest version of the new design says *if the client doesn't recognize a kind, drop it*. That's the parser-friendly version. It's also the version that lets older clients silently degrade — exactly the failure mode we were trying to fix.
+
+The right version says *every `ui_block` envelope must include a text representation of itself that any client can render*. The card has a structured payload for clients that know how to render it richly, *and* a string that says, in plain prose, what the card was showing. Old clients render the prose. New clients render the card. The user gets something either way; the structured version is just an upgrade for clients that have the renderer.
+
+This sounds easy. It is not easy. Writing a text fallback for a workout summary card means deciding what the prose version of *"three sets, last week, eight reps at 80kg, ratchet up next time"* should sound like. The fallback has to be good enough that it's not insulting to the user, but not so good that the rich card becomes pointless. Every card kind has to do this work, and the work is product copy, not engineering. We made the fallback a *required field on every kind's schema* — the contract refuses to validate an envelope without one. That sounds bureaucratic; it's the thing that forces the product question to be answered every time a new kind is proposed, rather than being skipped until someone complains.
+
+### The dual-emit migration
+
+We didn't want to flip the wire format in one cut. The old event types had been in production for weeks; the frontend was built around them; even the tests asserted the old shape. A flag-day migration was the kind of move that breaks the chatbot at the wrong moment for the wrong reason.
+
+So during the migration the backend emits *both*: the old event type (`workout_card`) and the new envelope (`ui_block` with `kind: workout_card`, `version: 1`, same payload, plus the text fallback). The frontend prefers the envelope when it sees one, falls back to the old event when it doesn't. The order is deterministic — old event first, envelope second — so a frontend that's been updated to prefer the envelope always finds it before it commits to the old event.
+
+This pattern is older than us; it's the standard way to migrate a wire protocol without a flag day. The thing that surprised me was how *cheap* it was to add — the cost of emitting both is one line in the orchestrator, the cost of the frontend handling both is a small switch in the dispatcher. The expensive part was *deciding to do it dually* in the first place, not the code.
+
+There's a real caveat here I want to be honest about. The dual-emit currently lives only on the admin and playground wire — the production mobile path has a sanitizing layer that filters the wire down to a curated set of events, and that layer doesn't yet forward `ui_block`. So today, on production mobile builds, users still receive only the old event types. The new clients are *ready* for the envelope; nothing's *sending* them the envelope yet on the path they're listening to. The one-line change that closes this loop is on the roadmap. The architecture is in place; the rollout isn't finished.
+
+I include this caveat because it matters. A post that pretends the work is finished when the rollout isn't is a post that's been smoothed for LinkedIn. The honest version is *we built it, we tested it, we know it works in the lab, we haven't flipped the production switch yet*. That's where most architectural work actually lives — between *done* and *deployed*, which are not the same thing.
+
+### The decoder boundary
+
+On the frontend, we wanted exactly one place in the codebase that knew about the envelope. The rest of the app should keep dealing with the typed cards it already knew about — *WorkoutCard*, *AlternativesCard* — without caring that those types now arrive wrapped in a `ui_block`.
+
+So there's a single function — *decode_ui_block* is what we called it — that takes the envelope, looks at the kind+version, and returns the typed card the rest of the app expects. If the kind is unknown, it returns the text fallback as a plain text message. That's the entire boundary. The chat cubit, the screen, the renderers — none of them know the envelope exists. They keep operating on the typed cards.
+
+This is the architectural shape that mattered the most. It's the same shape as a few other systems we've built: *the seam where polymorphism lives is exactly one place, and everything on either side of the seam is kind-agnostic*. The orchestrator emits `ui_block`s; the renderer registry consumes typed cards; *the decoder is the only function in the codebase that knows how to translate between the two*. Adding a new kind is a change in three places — the schema, the renderer registry entry, the dispatch arm of the decoder — and zero places anywhere else. Removing a kind is the same three places. The blast radius of every future change to the wire format collapses to this single function.
+
+## The architecture, in one picture
+
+<Mermaid
+  chart="
+flowchart LR
+    O[Backend orchestrator] -->|emits| W{Wire protocol}
+    subgraph Wire [ui_block envelope]
+      W1[kind: workout_card<br/>version: 1<br/>payload: ...<br/>text_fallback: '...']
+      W2[kind: alternatives_card<br/>version: 1<br/>payload: ...<br/>text_fallback: '...']
+      W3[kind: future_kind<br/>version: 1<br/>payload: ...<br/>text_fallback: '...']
+    end
+    W --> S[Single decoder boundary<br/>decode_ui_block]
+    S -->|known kind| R1[Typed renderer registry]
+    S -->|unknown kind| R2[Text fallback renderer]
+    R1 --> U([User])
+    R2 --> U
+"
+/>
+
+The thing the diagram is trying to show is that the wire format and the rest of the app are connected by exactly one function. Add a kind: one schema, one registry entry, one arm in the decoder. Subtract a kind: same three places. Everything else in the app keeps working the same way it did the day we shipped it.
+
+## The numbers (at the end, where they belong)
+
+Test counts at the moment the work landed. None of these is a latency-style number — the work wasn't about making the system faster, it was about making it harder to break later.
+
+| Bucket | Tests |
+| --- | --- |
+| Contract conformance (schema validation per kind, per version) | 34 |
+| Dual-emit (old event + new envelope arrive in expected order) | 9 |
+| Text-fallback (every kind has a non-empty fallback that renders) | 12 |
+| Backend chat suite (regression net for the broader changes) | 275 |
+| Frontend intelligence package (parser + decoder + dispatch) | 79 |
+| Frontend chat module (renderer registry + screens) | 191 |
+| New event types added to the production wire after this work | **0** |
+| Old event types we plan to remove once the dual-emit rollout completes | **2** |
+
+The two numbers worth dwelling on are the bottom two. The point of this work was that the *next* card we ship doesn't add an event type. It adds a kind inside the same envelope. The contract grows; the wire doesn't.
+
+## The deeper why — protocols outlive their authors
+
+There is a thing every wire format eventually learns about itself, which is that it will outlive the team that built it. The first version of a protocol is always designed by the people who can answer questions about it; the third version is being maintained by people who weren't in the room. The shape that survives is the shape that doesn't require everyone to be in the room.
+
+<Callout title="The contract a wire format needs">
+Old clients will outlive the protocol assumptions you make today. Every shipped mobile build is a frozen consumer of whatever wire shape was true the day it shipped. The job of the protocol isn't to evolve cleverly — it's to evolve in a way that doesn't ask the frozen consumers to do work they can't do anymore.
+</Callout>
+
+A polymorphic envelope is a small thing in code. It's a large thing in time. It says: *for as long as this product exists, no future card we add is going to require the people on the old build to update. The old build will get a slightly degraded version of every future feature, forever — but it will keep working.* That's a contract with users we won't ever meet, who installed our app once and never updated, who are still using it three years from now because it does what they need. The wire format is, in a small way, our promise to those users.
+
+The same shape shows up in places that have nothing to do with chat protocols. SQL migrations that add nullable columns. Configuration files that prefer additive changes. Public APIs that hide additions behind `kind`-discriminated payloads. Any time the consumer of a thing can't be updated atomically with the producer, the consumer is going to be older than the producer for the rest of the system's life — and the producer has to design around that.
+
+The wire format is just where this principle is unavoidable. Mobile builds make the asymmetry visible. If our consumers were all servers we controlled, we could flip everything together and not think about this. They aren't, and we can't, and the protocol has to know that.
+
+## What I'd want you to take from this — even if you don't write code
+
+<Cards>
+  <Card icon={<EarIcon />} title="A three-bullet review comment can be a design review in disguise.">
+    The reviewer didn't write code. They didn't write a spec. They wrote three sentences. The first one was small. The second one was *the entire problem stated correctly*. The third one was the shape of the fix. Most senior intuition arrives in bullet-point form on a Tuesday afternoon. The work is to recognize that the cost of the small comment is the cost of the entire system if you ignore it.
+  </Card>
+
+  <Card icon={<DoorOpenIcon />} title="Old clients are users. Treat them like users.">
+    Every shipped mobile build is a frozen consumer that will be on someone's phone for years. *"They should just update"* is not a design strategy; it's an excuse. The right protocol design assumes that the cost of asking every user to update is infinite, and shapes the protocol so you never have to ask.
+  </Card>
+
+  <Card icon={<LayersIcon />} title="Put the polymorphism behind one named seam.">
+    The decoder is a single function. The rest of the app doesn't know the envelope exists. Adding a new kind is three lines in three files; removing a kind is the same three lines. Every architecture that has aged well has this shape somewhere — a single seam that absorbs the dimension along which the system will change, with everything on either side of the seam staying kind-agnostic.
+  </Card>
+
+  <Card icon={<MessageSquareIcon />} title="Required fields force the product questions to be answered on time.">
+    Making the text fallback a required field in the schema is a tiny piece of bureaucracy that prevents an entire class of UX regressions. Every required field in a schema is a question the team has to answer *before* shipping rather than after. Most architectural discipline is really *temporal discipline* — making sure the right question gets asked at the right time.
+  </Card>
+
+  <Card icon={<EyeOffIcon />} title="The work isn't finished until it's deployed — and that's two different milestones.">
+    We built the envelope. We tested it. We shipped the architecture. The production mobile path doesn't forward it yet. *Done* and *deployed* are not the same word. Most architectural posts skip this caveat because admitting the rollout isn't finished makes the work sound smaller. It doesn't make the work smaller; it makes the writeup more honest. Architecture is a series of milestones, and the most expensive one is usually the last one.
+  </Card>
+</Cards>
+
+---
+
+*This is the last of a three-post series on building Symmetry Intelligence. If you missed the others: [the routing layer that cut chatbot latency by 77%](/posts/we-stopped-asking-the-smart-model-everything/) and [the nine-tool surface we collapsed to four](/posts/our-chatbot-had-nine-tools/). Together they're the story of a few weeks of architecture work that all came from the same instinct — that the right system for the next user is rarely the same system you shipped on day one, and that the gap between the two is where most of the senior engineering work actually happens.*

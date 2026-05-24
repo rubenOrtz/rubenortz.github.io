@@ -1,0 +1,179 @@
+---
+title: "Our chatbot had nine tools. We needed four."
+description: "The intuition that helps you design REST APIs makes you build the wrong tool surface for LLM agents. A story about a warning I missed, a metric I had to instrument before I'd believe it, and the four tools that replaced nine."
+date: 2026-05-23
+---
+
+*Part two of a three-post series on building Symmetry Intelligence. The previous post — [our chatbot took 17 seconds to say "you're welcome"](/posts/we-stopped-asking-the-smart-model-everything/) — covers the routing layer that decides which model gets each message. This one is what we found after, when the routing was working and the chatbot was still doing more work per turn than it had to.*
+
+---
+
+The first version of our chatbot shipped with nine tools. *Read memory. Update memory. Read the user's profile. Search exercises. Get workout history. Get the user's saved workout plans. Get weight history. Get streaks. Look up help docs.* One tool per thing the chatbot might need. Each tool small, focused, well-typed, easy to reason about. Textbook API design.
+
+It also turned out to be wrong.
+
+It took us about a week of beta to see why, another week to admit why, and a Saturday afternoon to fix. The new surface has four tools. The chatbot is faster, the agent loops less, and the model writes better answers — for reasons that aren't obvious until you watch how an LLM actually uses the tools you give it.
+
+<Callout title="What this post is" type="info">
+A story about a teammate who said *"you have too many tools"* before we launched, about my missing the intuition behind it, and about the eval pipeline that finally made me see what they'd seen for free.
+
+About why the design discipline that builds great REST APIs is the wrong discipline when the consumer is an LLM agent. And about a reframe — *"granularity is a latency knob, not a code-organization choice"* — that applies to a lot more than tool surfaces.
+</Callout>
+
+## The intuition I didn't have
+
+Before launch, a teammate looked at the tool surface and said something like: *"this is going to make the chatbot slower. There are too many of them. They're doing one thing each."*
+
+I nodded. I disagreed without saying so. The tools were small and focused. Each one had a clear job. The interface was clean. *That was the discipline I'd learned as a backend engineer.* A REST API with twenty narrow endpoints is easier to reason about than one with three endpoints that take a `kind` parameter and switch on it. The fact that each tool returned one specific kind of data felt like a feature, not a bug.
+
+The teammate let it go. We shipped. The chatbot worked. For about a week.
+
+I want to be clear about one thing before the story continues, because the easy way to write this post would be to make the teammate look prescient and me look slow. The truth is more boring than that. They had an intuition I didn't have. Intuitions are pattern-matches from prior experience. They had built things for LLM agents before. I had built things for human developers. The two surfaces look the same from outside — both are *"here is a set of functions you can call"* — and the discipline transfers approximately *zero percent* between them. I just didn't know that yet.
+
+The data was about to teach me, expensively.
+
+## What "the chatbot is slow" actually looked like
+
+A week into the beta, response times for the analytical class of questions — *"how was my last workout?"*, *"give me feedback on my routine"* — were drifting up. The smalltalk class was fine (we'd already routed it away from the expensive model — *see [the previous post in this series](/posts/we-stopped-asking-the-smart-model-everything/)*). The lookup-style class was fine. The analytical class was slow, and getting slower as the beta cohort grew.
+
+The first guess was the obvious one — the analytical model was getting overloaded, the queue was lengthening, more requests meant more tail latency. That guess was wrong. The model's per-call latency was fine. The total response time was creeping up because *the model was calling more tools per response*.
+
+The chatbot has an instrumentation hook that records every tool call in a turn. For a typical analytical question — *"how was my squat session yesterday?"* — the model used to make one or two tool calls. Now it was making four. Five. Sometimes seven. Each call took half a second to a second. The model was *looping*: call a tool, look at the result, call another tool to get more context, look at that, decide it needed yet another tool, and so on. By the time it produced an answer, the user had been waiting twenty seconds for the model to have a complete picture of itself.
+
+We had an explicit metric for this. We called it the *loop rate*: the fraction of generations that included more than two tool calls. Before launch the loop rate was around five percent on the eval set. After launch it climbed past sixty-five percent. We were doing five-tool turns at a rate that wasn't sustainable.
+
+## The reframe — one sentence
+
+A few days into the investigation, we sat down with the eval pipeline and an evening's worth of generations and watched what the model was actually *doing* with the nine tools.
+
+The pattern was hard to miss once we'd looked at twenty turns in a row:
+
+<Callout title="The reframe" type="info">
+A narrowly-scoped tool means the model has to combine *several* of them to answer one question. Each combination is a separate round-trip. Each round-trip is a chance for the model to wander, second-guess, or fall into a loop. Nine tools wasn't precision — it was nine opportunities for the agent to take the long way around.
+</Callout>
+
+The chatbot was asked *"what was my last workout?"* and would chain together: *get user's profile* (to check unit preferences), *get workout history* (to find the last session), *search exercises* (to get the canonical name of the exercise the user did), *get weight history* (to compare against prior sessions), and then — only then — start composing an answer. Five tool calls. Two seconds of latency each, on average. Ten seconds before the model had begun to write a single token of response.
+
+Every one of those tool calls was *correct*, in the sense that the model had used the tool for what the tool was for. The problem wasn't the model. The problem was the surface we'd given it.
+
+## What we'd built — and why it was wrong
+
+The original nine tools mirrored, almost one-to-one, the structure of the backend's REST API. *We have a `/users` endpoint, so there's a `read_user_data` tool. We have a `/workouts/history` endpoint, so there's a `get_workout_history` tool. We have a `/weights` endpoint, so there's a `get_weight_history` tool.* Each backend resource got its own tool. The tools were thin wrappers around the corresponding routes.
+
+This is the way you build a REST API for human consumption. A human dev calling your API knows what they want, knows which endpoint corresponds to it, and can compose multiple calls themselves if they need to — they know in advance how many round-trips they'll need, because they planned the call sequence in their head. The granularity of the API is a contract; the human dev does the composition.
+
+An LLM agent is not a human dev. It does not plan the call sequence in its head. It plans it *one call at a time*, looking at the previous result to decide what to do next. Every call is a fresh decision. Every fresh decision is another chance to choose suboptimally. Nine tools was not a clean interface — it was *a tree of nine possible next moves at every step*, and the agent had to navigate it by trial and error.
+
+The intuition the teammate had — and that I didn't — is that **the right number of tools for an LLM agent is approximately the number of distinct *intents* a user has**, not the number of resources a backend exposes. Users don't say *"please call my profile endpoint and then my workouts endpoint and then my weights endpoint"*. They say *"how was my last workout?"*. One intent. One tool call should suffice.
+
+That's the rule we eventually wrote down: **one tool per question shape, not one tool per resource.**
+
+## What we kept and what we collapsed
+
+The redesign took an afternoon, mostly because the hardest part was deciding what *not* to keep. The final surface has four tools:
+
+- A **memory tool** that the model can use to remember things across conversations.
+- A **search tool** that finds an exercise by name when the model needs to refer to one specifically.
+- A **lookup tool** that pulls public help docs into the context when the user asks something procedural.
+- And — the load-bearing one — a single **user-data tool** that takes a *kind* parameter (training history, weight history, plans, streaks, profile, etc.) and a small set of filters, and returns the slice of the user's data that matches. One round-trip, one slice of data, one call.
+
+The fourth tool is what changed everything. Before, the model called four small tools and stitched the results together itself. After, the model calls one tool and gets back a coherent payload that already includes everything it would have asked for in the four calls. The compositional work moved from the model to the tool implementation, where it's a hundred lines of straightforward server code instead of a multi-second agent loop.
+
+There's a fashion in API design that calls this *"fat tools"* or *"composable surfaces"* and frames it as a design pattern. The framing is fine. The reason it works for agents is more specific: the agent's most expensive operation is *deciding what to do next*, because that decision happens in the model. Anything we can do to reduce the number of decisions reduces the cost. A fat tool eliminates three decisions and replaces them with three function arguments.
+
+## What the eval said
+
+We re-ran the eval set against the new tool surface. Same questions, same user fixtures, same evaluation rubric. Two numbers moved.
+
+The loop rate dropped from around sixty-five percent to around thirteen percent. Most generations now produce a full answer in one or two tool calls. The model is no longer wandering through the tool surface; it picks the tool, calls it, and writes.
+
+The per-front latency on the questions the model used to loop on dropped meaningfully — the *technique* front (questions about how to do an exercise) went from 100% loop rate to 0% loop rate, with a 46% drop in median latency at the same time. The *grounding* front (questions that need user data to answer) went from 100% to 0%. The *planning* front (questions that require the model to reason about a sequence of user actions) went from 64% to 4%.
+
+These weren't latency *optimizations* in the usual sense. We didn't make any single call faster. We just removed three or four calls from the typical turn.
+
+## The architecture, in one picture
+
+<Mermaid
+  chart="
+flowchart LR
+    Q([User question:<br/>How was my last workout?])
+    Q --> M{Model picks tool}
+    subgraph BEFORE [Before — 9 narrow tools]
+      direction TB
+      B1[get_user_profile]
+      B2[get_workout_history]
+      B3[search_exercises]
+      B4[get_weight_history]
+      B5[get_streaks]
+      B1 --> B2 --> B3 --> B4 --> B5
+    end
+    subgraph AFTER [After — 1 fat tool]
+      direction TB
+      A1[get_user_training<br/>kind=last_session<br/>include=exercise_names,weights]
+    end
+    M -.->|chained 4-5x| BEFORE
+    M -->|single call| AFTER
+    BEFORE --> R1([10 s before first token])
+    AFTER --> R2([2 s before first token])
+"
+/>
+
+The picture is the fix. The model used to walk down a corridor of nine doors, opening each one to peek at what was inside. Now it opens one door and gets the whole room.
+
+## The numbers (at the end, where they belong)
+
+Eval set: 296 generations on the same question bank, same user fixtures, before and after the redesign. Held up across a follow-up run of 1,424 generations with paraphrased prompts to check we hadn't overfit to the original phrasings.
+
+| Metric | Before (9 tools) | After (4 tools) | Δ |
+| --- | --- | --- | --- |
+| Loop rate (generations with >2 tool calls) | ~65 % | ~13 % | **−80 %** |
+| Technique-question loop rate | 100 % | 0 % | **eliminated** |
+| Technique-question median latency | baseline | −46 % | **faster** |
+| Grounding-question loop rate | 100 % | 0 % | **eliminated** |
+| Planning-question loop rate | 64 % | 4 % | **−94 %** |
+| Planning-question median latency | baseline | −14 % | faster |
+| Transport errors (both runs) | 0 | 0 | clean |
+
+Two numbers worth noting are the ones that *didn't* move. The user-thumb-up rate on responses didn't change. The accuracy of the responses, by the eval judge, didn't change. We didn't trade quality for speed. We removed steps that weren't producing any quality in the first place.
+
+## The deeper why — agents are not callers
+
+The most useful way I've found to think about this whole episode is that **an LLM agent is not a caller, it's a planner**.
+
+When a human developer calls your API, the developer has a plan in their head. They wrote that plan before they wrote the call. The API's job is to expose primitives the developer can compose; the composition is the developer's responsibility.
+
+When an LLM agent calls your API, the agent *is* the plan. The plan is happening one call at a time, conditioned on the results of every previous call. Every primitive you expose is another branch the agent has to consider at every step. The cost of considering branches is the cost of running the model. The cost of running the model dominates everything else.
+
+<Callout title="The contract a tool surface enforces">
+For human-consumed APIs, granularity is a feature — it gives the caller control. For agent-consumed APIs, granularity is a cost — it gives the agent more decisions to make. The right surface for an agent is the smallest set of tools that covers the user's intents, with each tool fat enough to answer one question in one call.
+</Callout>
+
+This is the kind of design taste that doesn't transfer from a portfolio of REST APIs. It's not in the textbooks because the textbooks were written before the textbook readers were also calling the API. You learn it by watching an agent loop, the same way you learn most things in systems work — by instrumenting the thing, sitting down with the data, and letting the data tell you what you were doing.
+
+## What I'd want you to take from this — even if you don't write code
+
+<Cards>
+  <Card icon={<ScanIcon />} title="Intuitions from one medium often fail in the next one, silently.">
+    The REST API discipline I was using was *correct* for human callers and *wrong* for agent callers. The two surfaces look identical from outside. The cost of the mistake didn't show up until the system was under real load, and even then it showed up as *latency*, not as *wrong design*. Most discipline mismatches are like this — they don't announce themselves; they slowly bleed performance out of a system you thought was healthy.
+  </Card>
+
+  <Card icon={<EarIcon />} title="The person with the right intuition rarely has time to explain it before launch.">
+    The teammate who said *"you have too many tools"* wasn't going to stop the release over it. They flagged it once and moved on. That's how almost all senior intuitions get communicated in fast-moving teams. The lesson isn't *"listen harder"* — it's *"build the measurement that would have proved them right, so the data does the convincing for you next time"*.
+  </Card>
+
+  <Card icon={<RouteIcon />} title="Granularity is a cost, not just an organization choice.">
+    Every primitive you expose to a caller — whether human or agent or human-via-form — is another decision the caller has to make. For some callers (human devs writing thoughtful code) granularity gives them control and is a feature. For other callers (agents making one decision at a time, anyone in a hurry) granularity is a tax. Match the granularity to the caller.
+  </Card>
+
+  <Card icon={<ActivityIcon />} title="Instrumentation eats arguments.">
+    The right metric — the *loop rate* — settled an argument that had been running on intuition. You can't out-argue someone who has the histogram. Most of the highest-leverage work in any system is building the metric that would tell you which intuition was correct, *before* the cost of being wrong gets large.
+  </Card>
+
+  <Card icon={<EyeOffIcon />} title="The cheapest changes are the ones that subtract.">
+    The fix shipped in an afternoon. It deleted more code than it added. It produced more measurable user-facing improvement than three months of feature work would have. The single highest-leverage move in a system that has grown organically is almost always *removing* something that nobody had a reason to add but that nobody has had a reason to remove either.
+  </Card>
+</Cards>
+
+---
+
+*Next in this series: [every new card in our chatbot was a breaking change.](/posts/every-new-card-was-a-breaking-change/) The data contract problem this whole arc exposed — and the polymorphic wire format that fixed it. The final post in the series.*
