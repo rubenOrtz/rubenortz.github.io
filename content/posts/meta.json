@@ -3,8 +3,6 @@
   "pages": [
     "every-new-card-was-a-breaking-change",
     "our-chatbot-had-nine-tools",
-    "we-stopped-asking-the-smart-model-everything",
-    "how-a-feature-rotted-for-six-months",
-    "cold-start-25x-by-deleting-code"
+    "we-stopped-asking-the-smart-model-everything"
   ]
 }
