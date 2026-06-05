@@ -36,7 +36,13 @@ export default function PostsIndexPage(): ReactElement {
     return db - da
   })
 
-  const [featured, ...rest] = sorted
+  // A post can be pinned to the hero slot via `featured: true` in its
+  // frontmatter, independent of date. Falling back to the newest keeps the
+  // index sensible when nothing is pinned.
+  const pinned = sorted.find((page) => page.data.featured)
+  const featured = pinned ?? sorted[0]
+  const rest = sorted.filter((page) => page !== featured)
+  const isPinned = Boolean(pinned)
 
   return (
     <main className='relative mx-auto w-full max-w-3xl px-4 py-16 md:py-24'>
@@ -64,7 +70,7 @@ export default function PostsIndexPage(): ReactElement {
       {/* Featured (latest) post */}
       {featured && (
         <section className='mb-16'>
-          <SectionLabel>Latest</SectionLabel>
+          <SectionLabel>{isPinned ? 'Featured' : 'Latest'}</SectionLabel>
           <Link
             href={featured.url}
             className='group relative block overflow-hidden rounded-2xl border border-fd-border bg-fd-card p-8 transition-all duration-200 hover:-translate-y-0.5 hover:border-fd-foreground/30 hover:shadow-xl md:p-10'
@@ -117,7 +123,7 @@ export default function PostsIndexPage(): ReactElement {
       {/* Earlier posts */}
       {rest.length > 0 && (
         <section className='mb-16'>
-          <SectionLabel>Earlier</SectionLabel>
+          <SectionLabel>{isPinned ? 'More posts' : 'Earlier'}</SectionLabel>
           <ul className='-mx-4 flex flex-col divide-y divide-fd-border'>
             {rest.map((page) => (
               <li key={page.url}>

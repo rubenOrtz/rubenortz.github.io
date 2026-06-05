@@ -175,6 +175,12 @@ export const posts = defineDocs({
   docs: {
     schema: pageSchema.extend({
       date: z.coerce.date(),
+      /**
+       * Pins a post to the hero ("Featured") slot of the index regardless of
+       * its date. At most one post should set this; if several do, the newest
+       * wins. When unset, the index falls back to showing the latest by date.
+       */
+      featured: z.boolean().default(false),
     }),
     async: true,
   },
